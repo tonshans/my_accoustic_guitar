@@ -104,6 +104,9 @@ void oled_pixel(int x, int y, bool on)
 void oled_hline(int x, int y, int w, bool on)
 { for (int i = 0; i < w; i++) oled_pixel(x + i, y, on); }
 
+void oled_vline(int x, int y, int h, bool on)
+{ for (int j = 0; j < h; j++) oled_pixel(x, y + j, on); }
+
 void oled_rect(int x, int y, int w, int h, bool on)
 {
     oled_hline(x, y, w, on);

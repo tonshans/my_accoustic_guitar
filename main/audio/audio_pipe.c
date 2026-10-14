@@ -12,13 +12,6 @@
 
 static const char *TAG = "audio_pipe";
 
-/* gtr_ring_init() returns bool (it is called from the IRAM RX path, where
- * esp_err_t logging would be inappropriate); wrap it for ESP_RETURN_ON_ERROR. */
-static esp_err_t ring_init_or_fail(gtr_ring_t *ring)
-{
-    return gtr_ring_init(ring) ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
 audio_pipe_t g_audio;
 
 static i2s_chan_handle_t rx_chan;
@@ -51,8 +44,10 @@ IRAM_ATTR static bool tx_dma_cb(i2s_chan_handle_t handle,
 /* ------------------- init ------------------- */
 esp_err_t audio_pipe_init(void)
 {
-    ESP_RETURN_ON_ERROR(gtr_ring_init(&g_audio.in_ring),  __TAG, "in ring");
-    ESP_RETURN_ON_ERROR(gtr_ring_init(&g_audio.out_ring), __TAG, "out ring");
+    ESP_RETURN_ON_FALSE(gtr_ring_init(&g_audio.in_ring),  ESP_ERR_NO_MEM,
+                        TAG, "in ring");
+    ESP_RETURN_ON_FALSE(gtr_ring_init(&g_audio.out_ring), ESP_ERR_NO_MEM,
+                        TAG, "out ring");
     g_audio.rx_overruns = 0;
     g_audio.tx_underruns = 0;
 

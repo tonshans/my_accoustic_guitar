@@ -31,7 +31,7 @@ CONFIG_FREERTOS_UNICORE=n
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
 
 # --- Interrupts placed in IRAM => lowest, jitter-free I2S ISR latency ---
-CONFIG_GRP_PLACE_ISR_IN_IRAM=y
+CONFIG_I2S_ISR_IRAM_SAFE=y
 
 # --- Logging: quiet on console so UART never blocks the audio path ---
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y

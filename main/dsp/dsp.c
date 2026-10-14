@@ -20,6 +20,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_timer.h"
 
 #define TAP_DELAY_S      0.04f     /* reverb pre-delay        */
@@ -437,6 +438,9 @@ void dsp_init(void)
     tuner_init();
 }
 
+/* Forward declaration: the core-0 block-cadence task is defined below. */
+static void IRAM_ATTR dsp_task(void *arg);
+
 void dsp_start_task(void)
 {
     s_wake_sem = xSemaphoreCreateBinary();
@@ -444,7 +448,15 @@ void dsp_start_task(void)
                                          .dispatch_method = ESP_TIMER_ISR,
                                          .name = "dsp_cadence" };
     ESP_ERROR_CHECK(esp_timer_create(&ta, &s_cadence_timer));
-    xTaskCreatePinnedToCore(dsp_task, "dsp", 4096, NULL, PRIO_DSP, NULL, CORE_AUDIO);
+
+    /* The task body lives in IRAM (IRAM_ATTR below); its stack is allocated
+     * from internal RAM explicitly so no part of the audio domain ever
+     * depends on PSRAM (ARCHITECTURE.md §7). */
+    StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    StackType_t *stk  = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL);
+    assert(tcb && stk);
+    xTaskCreateStaticPinnedToCore(dsp_task, "dsp", 4096, NULL, PRIO_DSP,
+                                  stk, tcb, CORE_AUDIO);
 }
 
 bool dsp_task_alive(void)
