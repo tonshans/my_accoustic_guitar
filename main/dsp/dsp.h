@@ -55,6 +55,12 @@ void dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on);
  * output was forced to silence (should stay at 0 during normal playing). */
 extern volatile uint32_t g_dsp_overruns;
 
+/* Bumped once per processed block — health watchdog for core 1. */
+extern volatile uint32_t g_dsp_beat;
+
+/* True once the DSP task has completed at least one block. */
+bool dsp_task_alive(void);
+
 /* Snapshot of live settings (copy — safe from any task). */
 void dsp_get_settings(dsp_settings_t *dst);
 

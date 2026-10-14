@@ -29,6 +29,7 @@ static dsp_settings_t s_set;
 static SemaphoreHandle_t s_param_lock;
 
 static volatile uint16_t s_peak_in, s_peak_out;
+volatile uint32_t g_dsp_beat;              /* bumped once per processed block */
 
 /* Block-cadence helpers used by the DSP task (created in dsp_start_task). */
 static SemaphoreHandle_t s_wake_sem;
@@ -385,6 +386,11 @@ void dsp_start_task(void)
     xTaskCreatePinnedToCore(dsp_task, "dsp", 4096, NULL, PRIO_DSP, NULL, CORE_AUDIO);
 }
 
+bool dsp_task_alive(void)
+{
+    return g_dsp_beat != 0;                /* false until the first block ran */
+}
+
 uint16_t dsp_peak_in(void)  { return s_peak_in;  }
 uint16_t dsp_peak_out(void) { return s_peak_out; }
 
@@ -393,18 +399,24 @@ uint16_t dsp_peak_out(void) { return s_peak_out; }
  * int32 stereo block from the RX ring, converts to Q15, runs the two pipeline
  * stages under a hard deadline watch, and hands the result to the TX ring.
  * No allocations, no logging, no flash access in this loop. */
+/* PCM1808/MAX98357A are configured as I2S masters with 32-bit Philips slots:
+ * the ADC right-justifies its 24 valid bits in the slot (bits 3..26), so we
+ * take bits 14..29 for a Q15 value that sits 2 dB below full scale — exactly
+ * the acoustic headroom the anti-feedback budget asks for. The TX conversion
+ * mirrors this by re-right-justifying into bits 3..26. */
+static inline IRAM_ATTR int16_t q15_from_i32(int32_t v)
+{
+    return sat16(v >> SAMPLE_SHIFT);
+}
+
 static void IRAM_ATTR convert_int32_back(const int16_t *src, int32_t *dst, size_t words)
 {
-    /* Q15 -> left-justified 32-bit slot (<<11 matches convert_q15 headroom) */
     for (size_t i = 0; i < words; i++) dst[i] = (int32_t)src[i] << SAMPLE_SHIFT;
 }
 
 static void IRAM_ATTR convert_q15(const int32_t *src, int16_t *dst, size_t frames)
 {
-    for (size_t i = 0; i < frames; i++) {
-        dst[2*i]     = (int16_t)(src[2*i]     >> SAMPLE_SHIFT);
-        dst[2*i + 1] = (int16_t)(src[2*i + 1] >> SAMPLE_SHIFT);
-    }
+    for (size_t i = 0; i < 2 * frames; i++) dst[i] = q15_from_i32(src[i]);
 }
 
 static void dsp_task(void *arg)
@@ -446,6 +458,7 @@ static void dsp_task(void *arg)
         }
         convert_int32_back(q15_o, raw_o, BLOCK_WORDS);
         gtr_ring_write(&g_audio.out_ring, raw_o, BYTES_PER_BLOCK);
+        g_dsp_beat++;
 
         /* Hold the block cadence: absolute-time sleep keeps long-term drift
          * at zero even if individual iterations jitter. */

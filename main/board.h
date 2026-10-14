@@ -33,9 +33,11 @@
 #define BYTES_PER_BLOCK      (BLOCK_WORDS * sizeof(int32_t))
 #define RING_BYTES           (BYTES_PER_BLOCK * RING_BLOCKS)
 
-/* 32-bit PCM samples arrive left-justified in the slot; >>11 gives Q15 headroom
- * so that mixing several effect paths never overflows int16 at the DAC stage. */
-#define SAMPLE_SHIFT         11
+/* PCM1808 places its 24 valid bits right-justified in the 32-bit Philips slot
+ * (bits 3..26). Taking bits 14..29 yields a Q15 value ~2 dB below full scale:
+ * exactly the mixing headroom so several effect paths never overflow int16 at
+ * the DAC stage. The TX side re-right-justifies with <<14 (see dsp.c). */
+#define SAMPLE_SHIFT         14
 #define Q15_MAX              0x7FFF
 
 /* ---------------- I2S0 RX: PCM1808 (BCLK=4, LRCK=5, DATA=6) ---------------- */
