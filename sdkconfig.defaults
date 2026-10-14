@@ -1,0 +1,41 @@
+# ------------------------------------------------------------------
+# ESP32-S3 N16R8 — Acoustic Guitar FX + Tuner (Phase 1)
+# ------------------------------------------------------------------
+
+# --- Target & Flash / PSRAM ---
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# Keep audio-critical allocations internal; big DSP buffers use
+# heap_caps_malloc(MALLOC_CAP_SPIRAM) explicitly in the code.
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+
+# --- CPU: fixed 240 MHz, no DFS (deterministic DSP timing) ---
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_PM_ENABLE=n
+CONFIG_FREERTOS_HZ=1000
+
+# --- No wireless in Phase 1 ---
+CONFIG_BT_ENABLED=n
+CONFIG_ESP_WIFI_ENABLED=n
+
+# --- Main task pinned to core 1 so core 0 is free for audio ---
+CONFIG_FREERTOS_UNICORE=n
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
+
+# --- Interrupts placed in IRAM => lowest, jitter-free I2S ISR latency ---
+CONFIG_GRP_PLACE_ISR_IN_IRAM=y
+
+# --- Logging: quiet on console so UART never blocks the audio path ---
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- FreeRTOS tick idle hook used by the UI/monitor task ---
+CONFIG_FREERTOS_USE_IDLE_HOOK=n

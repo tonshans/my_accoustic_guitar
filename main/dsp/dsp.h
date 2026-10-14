@@ -1,0 +1,69 @@
+/*
+ * dsp.h — Q15 fixed-point guitar effects chain (runs on core 0, IRAM).
+ *
+ *   in -> HPF(80-100 Hz) -> soft limiter -> { dry | slap delay | chorus | reverb }
+ *      -> wet/dry mix -> master gain -> out
+ *
+ * The tuner taps the PRE-EFFECTS signal (requirement 5.4) inside stage A.
+ *
+ * Determinism rules inside dsp_process_block():
+ *   - no malloc/free, no logging, no locks, no float ops in the sample loop
+ *   - all state lives in internal RAM; hot code is IRAM-resident
+ */
+#ifndef __GTR_DSP_H__
+#define __GTR_DSP_H__
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* UI-visible / persisted settings. The UI task writes them under
+ * dsp_param_mutex(); the audio task snapshots them once per block. */
+typedef struct {
+    int8_t   preset;                    /* index into preset table            */
+    bool     fx_on;                     /* false = bypass (crossfaded)        */
+    uint8_t  delay_mix, chorus_mix, reverb_mix;   /* wet mix 0..100 %         */
+    uint16_t delay_ms;                  /* slap-back time, 20..400 ms         */
+    uint8_t  delay_fb;                  /* feedback 0..90 %                   */
+    uint16_t chorus_rate_mhz;           /* LFO rate in millihertz 100..2000   */
+    uint16_t chorus_depth_us;           /* modulation depth in microseconds   */
+    uint8_t  hpf_hz;                    /* HPF cutoff: 80/90/100 (0 = off)    */
+    uint8_t  master_pct;                /* output gain %, conservative        */
+} dsp_settings_t;
+
+void dsp_init(void);
+
+/* One processing call == BLOCK_SAMPLES stereo frames (Q15 int16 pairs).
+ * Called only from the DSP task. `tuner_on` routes pre-effect audio to the
+ * pitch detector without touching the audio path itself. */
+void dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on);
+
+/* Snapshot of live settings (copy — safe from any task). */
+void dsp_get_settings(dsp_settings_t *dst);
+
+/* Field ids used by the UI page descriptors (dsp_set_field): */
+enum {
+    FLD_DELAY_MIX, FLD_DELAY_MS, FLD_DELAY_FB,
+    FLD_CHORUS_MIX, FLD_CHORUS_RATE, FLD_CHORUS_DEPTH,
+    FLD_REVERB_MIX, FLD_HPF, FLD_MASTER,
+};
+
+/* Update one field + recompute filter coefficients. Safe from UI task
+ * (takes the param mutex internally; coefficient update happens at the
+ * next block boundary via a dirty flag — never mid-sample). */
+void dsp_set_field(int field_id, int value);
+
+void dsp_set_fx(bool on);               /* triggers a click-free crossfade */
+
+/* Metering for the OLED level bar (peak of last processed block, Q15). */
+uint16_t dsp_peak_in(void);
+uint16_t dsp_peak_out(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

@@ -1,0 +1,126 @@
+# ============================================================
+#  Acoustic Guitar FX + Tuner — ESP32-S3 N16R8 (Phase 1)
+#  Piezo -> MCP6002 -> PCM1808 -> I2S0 RX -> DSP -> I2S1 TX -> MAX98357A -> Exciter
+# ============================================================
+
+config SAMPLE_RATE
+    int "Audio sample rate (Hz)"
+    default 44100
+
+config AUDIO_FRAME_SAMPLES
+    int "Samples per processing block (per channel)"
+    default 128
+    help Ring-block size. 128 @ 44.1 kHz = ~2.9 ms granularity.
+
+config TUNER_ENABLED
+    bool "Enable chromatic tuner"
+    default y
+
+# ---------------- Anti-feedback chain ----------------
+config HPF_CUTOFF_HZ
+    int "High-pass cutoff (Hz), suppresses body/soundhole feedback"
+    default 90
+
+config LIMITER_THRESHOLD
+    hex "Soft-clip threshold (Q15). 0x7fff = full scale"
+    default 0x5cc0
+    help Transients above ~0.36 FS are softly compressed (anti-larsen).
+
+config OUTPUT_GAIN_PCT
+    int "Master output gain in percent (conservative vs. feedback)"
+    range 0 100
+    default 70
+
+# ---------------- Effect defaults (presets stored in NVS override) ----------------
+config DELAY_TIME_MS_DFLT
+    int "Default slap-back delay time (ms)"
+    default 90
+
+config DELAY_FEEDBACK_PCT_DFLT
+    int "Default delay feedback (%)"
+    default 30
+
+config DELAY_MIX_PCT_DFLT
+    int "Default delay wet mix (%)"
+    default 35
+
+config CHORUS_RATE_MHZ
+    int "Default chorus LFO rate (mHz)"
+    default 550
+
+config CHORUS_DEPTH_US
+    int "Default chorus depth (microseconds of delay modulation)"
+    default 600
+
+config CHORUS_MIX_PCT_DFLT
+    int "Default chorus wet mix (%)"
+    default 30
+
+config REVERB_MIX_PCT_DFLT
+    int "Default reverb wet mix (%)"
+    default 25
+
+# ---------------- UI timing ----------------
+config UI_PERIOD_MS
+    int "UI / tuner refresh period (ms)"
+    default 20
+
+# ---------------- Pin assignments (ESP32-S3-WROOM-1 N16R8) ----------------
+menu "I2S pin assignments"
+    config I2S_IN_BCK_PIN
+        int "PCM1808 BCK GPIO (ESP32 is I2S master)"
+        default 12
+    config I2S_IN_WS_PIN
+        int "PCM1808 WS / LRCLK GPIO"
+        default 11
+    config I2S_IN_DIN_PIN
+        int "PCM1808 DOUT -> ESP32 SD input GPIO"
+        default 13
+    config I2S_IN_MCLK_PIN
+        int "PCM1808 MCLK GPIO (-1 = not wired)"
+        default 10
+
+    config I2S_OUT_BCK_PIN
+        int "MAX98357A BCK GPIO"
+        default 18
+    config I2S_OUT_WS_PIN
+        int "MAX98357A L/RCLK GPIO"
+        default 17
+    config I2S_OUT_DOUT_PIN
+        int "MAX98357A DIN GPIO"
+        default 16
+    config I2S_OUT_MCLK_PIN
+        int "MAX98357A MCLK GPIO (-1 = not connected, internal PLL)"
+        default -1
+endmenu
+
+menu "OLED (I2C) pins"
+    config OLED_I2C_PORT
+        int "I2C port for the OLED (0 or 1)"
+        default 0
+
+    config OLED_SDA_PIN
+        int "OLED SDA GPIO"
+        default 8
+    config OLED_SCL_PIN
+        int "OLED SCL GPIO"
+        default 9
+    config OLED_ADDR
+        hex "SSD1306 I2C address (0x3c or 0x3d)"
+        default 0x3c
+endmenu
+
+menu "Encoder & buttons"
+    config ENC_A_PIN
+        int "Rotary encoder A GPIO"
+        default 6
+    config ENC_B_PIN
+        int "Rotary encoder B GPIO"
+        default 7
+    config BTN_SEL_PIN
+        int "BTN_SEL GPIO (short: preset next, long: save preset)"
+        default 5
+    config BTN_ACT_PIN
+        int "BTN_ACT GPIO (short: bypass, long: tuner toggle)"
+        default 4
+endmenu

@@ -1,0 +1,393 @@
+/*
+ * dsp.c — Q15 fixed-point guitar effects.
+ *
+ *   Reverb : Schroeder topology (4 comb + 4 all-pass + damping one-pole),
+ *            realized as a deterministic 32-tap FIR built from the analytic
+ *            impulse response at init time (no recursion at run time).
+ *   Chorus : sinusoidally modulated delay line, linear interpolation.
+ *   Delay  : single-feedback slap-back.
+ *   Anti-larsen: RBJ biquad HPF (80..100 Hz) + cubic soft clipper.
+ *   Bypass : equal-power crossfade over ~3 ms (no pops/clicks).
+ */
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include "dsp.h"
+#include "tuner.h"
+#include "board.h"
+#include "esp_attr.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+#define TAP_DELAY_S      0.04f     /* reverb pre-delay        */
+#define CHORUS_BASE_US   8000      /* chorus nominal delay    */
+#define XFADE_BLOCKS     1         /* bypass fade ~= 2.9 ms   */
+
+static dsp_settings_t s_set;
+static SemaphoreHandle_t s_param_lock;
+
+static volatile uint16_t s_peak_in, s_peak_out;
+
+/* ------------------------- helpers -------------------------- */
+static inline int32_t mul_q15(int32_t x, int32_t y) { return (x * y) >> 15; }
+
+static inline int16_t sat16(int32_t v)
+{
+    if (v >  32767) return  32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
+/* Cubic soft clipper above threshold T: maps [T..FS] -> [T..FS],
+ * slope-continuous at T (anti-transient / anti-oscillation guard). */
+static inline IRAM_ATTR int16_t soft_clip(int16_t x)
+{
+    const int32_t t = CONFIG_LIMITER_THRESHOLD;
+    const int32_t fs = 32767;
+    int32_t a = x < 0 ? -(int32_t)x : (int32_t)x;
+    if (a <= t) return x;
+    int32_t xn = ((a - t) << 15) / (fs - t);          /* 0..Q15 across range */
+    int32_t x2 = mul_q15(xn, xn);
+    int32_t x3 = mul_q15(x2, xn);
+    int32_t sh = xn - mul_q15(x3, 10923);             /* xn - xn^3/3 shape   */
+    int32_t y  = t + mul_q15(fs - t, sh + (sh >> 1)); /* stretch to reach FS */
+    if (y > fs) y = fs;
+    return sat16(x < 0 ? -y : y);
+}
+
+/* ------------------- HPF biquad (RBJ, Q=.707) ------------------- */
+typedef struct { int16_t b0, b1, b2, a1, a2; } biquad_t;
+static biquad_t s_hpf_c;
+static int32_t  s_hpf_z[2];                 /* DF-II transposed states */
+
+static void hpf_compute(float fc)
+{
+    float w = 6.2831853f * fc / SAMPLE_RATE;
+    float cw = cosf(w), sw = sinf(w);
+    float alpha = sw / 1.4142f, a0 = 1.0f + alpha;
+    s_hpf_c.b0 = sat16(((1.0f + cw) * 0.5f / a0) * 32767.0f);
+    s_hpf_c.b1 = sat16((-(1.0f + cw)      / a0) * 32767.0f);
+    s_hpf_c.b2 = sat16(((1.0f + cw) * 0.5f / a0) * 32767.0f);
+    s_hpf_c.a1 = sat16(((-2.0f * cw)      / a0) * 32767.0f);
+    s_hpf_c.a2 = sat16(((1.0f - alpha)    / a0) * 32767.0f);
+}
+
+static inline IRAM_ATTR int16_t hpf_run(int16_t x)
+{
+    if (!s_set.hpf_hz) return x;
+    const biquad_t *c = &s_hpf_c;
+    int32_t y = mul_q15(c->b0, x) + s_hpf_z[0];
+    s_hpf_z[0] = mul_q15(c->b1, x) - mul_q15(c->a1, y) + s_hpf_z[1];
+    s_hpf_z[1] = mul_q15(c->b2, x) - mul_q15(c->a2, y);
+    return sat16(y);
+}
+
+/* --------------------- circular delay lines --------------------- */
+static size_t next_pow2(size_t n) { size_t p = 1; while (p < n) p <<= 1; return p; }
+
+static int16_t *alloc_line(size_t samples, size_t *mask_out)
+{
+    size_t len = next_pow2(samples + BLOCK_SAMPLES + 8);
+    int16_t *b = heap_caps_malloc(len * sizeof(int16_t),
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    memset(b, 0, len * sizeof(int16_t));
+    *mask_out = len - 1;
+    return b;
+}
+
+/* ---- slap-back delay ---- */
+static int16_t *dly_buf; static size_t dly_mask, dly_pos;
+static int16_t  dly_fb_q15; static uint32_t dly_n;   /* whole samples */
+
+static inline IRAM_ATTR int16_t delay_run(int16_t x)
+{
+    size_t i = dly_pos;
+    int16_t echo = dly_buf[(i - dly_n - 1) & dly_mask];
+    dly_buf[i] = sat16(x + mul_q15(echo, dly_fb_q15));
+    dly_pos = (i + 1) & dly_mask;
+    return echo;
+}
+
+/* ---- chorus (LFO-modulated delay) ---- */
+/* full-cycle sine table, Q15, 64 points: sin(2*pi*i/64)*32767, interpolated */
+static const int16_t SINE_Q[64] = {
+       0,  3212,  6393,  9512, 12539, 15446, 18204, 20787, 23170, 25329, 27245, 28898,
+   30273, 31356, 32137, 32609, 32767, 32609, 32137, 31356, 30273, 28898, 27245, 25329,
+   23170, 20787, 18204, 15446, 12539,  9512,  6393,  3212,     0, -3212, -6393, -9512,
+  -12539,-15446,-18204,-20787,-23170,-25329,-27245,-28898,-30273,-31356,-32137,-32609,
+  -32767,-32609,-32137,-31356,-30273,-28898,-27245,-25329,-23170,-20787,-18204,-15446,
+  -12539, -9512, -6393, -3212
+};
+
+static int16_t *cho_buf; static size_t cho_mask, cho_pos;
+static uint32_t cho_phase, cho_inc;
+static int32_t  cho_depth_q16;              /* half-depth in samples, Q16 */
+
+static inline IRAM_ATTR int16_t lfo_value(void)
+{
+    uint32_t idx  = cho_phase >> 26;                    /* top 6 bits: 0..63 */
+    uint32_t frac = (cho_phase >> 20) & 0x3F;           /* next 6 bits       */
+    int32_t a = SINE_Q[idx], b = SINE_Q[(idx + 1) & 63];
+    return sat16(a + mul_q15(b - a, (int32_t)(frac * 517)));  /* frac*32767/64 */
+}
+
+static inline IRAM_ATTR int16_t chorus_run(int16_t x)
+{
+    cho_buf[cho_pos] = x;
+    cho_phase += cho_inc;
+    int32_t mod = mul_q15(lfo_value(), cho_depth_q16);            /* Q16 offset */
+    uint32_t base = (uint32_t)(CHORUS_BASE_US * SAMPLE_RATE / 1000000) << 16;
+    int64_t dv = (int64_t)base + mod;
+    if (dv < 0) dv = 0;
+    uint32_t d  = (uint32_t)dv;
+    uint32_t di = d >> 16, df = d & 0xFFFF;
+    size_t i0 = (cho_pos - 1 - di) & cho_mask;
+    size_t i1 = (i0 - 1) & cho_mask;
+    int32_t s = cho_buf[i0] + mul_q15(cho_buf[i1] - cho_buf[i0], (int32_t)(df >> 1));
+    cho_pos = (cho_pos + 1) & cho_mask;
+    return sat16(s);
+}
+
+/* ------------- Schroeder reverb as 32-tap FIR (analytic IR) ------------- */
+static const int COMB_D[4]  = { 1557, 1617, 1491, 1422 };
+static const int COMB_G[4]  = { 14855, 14784, 14642, 14561 };   /* ~0.90/0.85 */
+static const int ALLP_D[4]  = { 225, 556, 441, 341 };
+static const int ALLP_G[4]  = { 11469, 11469, 11469, 11469 };   /* 0.35 */
+#define LP_A_Q15 1638                                            /* damping pole */
+
+static int16_t  verb_taps[32];
+static uint16_t verb_idx[32];
+static int16_t *verb_buf; static size_t verb_mask, verb_pos;
+static int16_t  verb_lp;
+
+static void verb_build(void)
+{
+    int pre = (int)(TAP_DELAY_S * SAMPLE_RATE);
+    int ilen = pre + 24000;                       /* covers longest tail */
+    int16_t *imp = calloc(ilen, sizeof(int16_t));
+    int16_t *tmp = calloc(ilen, sizeof(int16_t));
+
+    /* parallel combs, input scaled by 1/4 to keep headroom */
+    for (int i = 0; i < 4; i++) {
+        double g = COMB_G[i] / 32767.0;
+        int n = (int)(-log(0.001) / log(g));  if (n > 30) n = 30;
+        double e = 32767.0;
+        for (int k = 0; k <= n; k++) {
+            int idx = pre + COMB_D[i] * k;
+            imp[idx] = sat16((int32_t)imp[idx] + (int32_t)(e / 4.0));
+            e *= g;
+        }
+    }
+    /* fold each cascaded all-pass exactly:
+     * H_ap(z) = (-g + z^-D) / (1 - g z^-D)
+     * => h_ap[0] = -g ; h_ap[kD] = (1-g^2) g^(k-1), k>=1 */
+    for (int a = 0; a < 4; a++) {
+        double g = ALLP_G[a] / 32767.0;
+        int n = (int)(-log(0.001) / log(g));  if (n > 30) n = 30;
+        memset(tmp, 0, ilen * sizeof(int16_t));
+        for (int i = 0; i < ilen; i++) {
+            if (!imp[i]) continue;
+            double x = imp[i];
+            tmp[i] = sat16((int32_t)tmp[i] - (int32_t)(g * x));
+            double w = x * (1.0 - g * g);
+            for (int k = 1; k <= n; k++) {
+                int j = i + ALLP_D[a] * k;
+                if (j >= ilen) break;
+                tmp[j] = sat16((int32_t)tmp[j] + (int32_t)w);
+                w *= g;
+            }
+        }
+        memcpy(imp, tmp, ilen * sizeof(int16_t));
+    }
+    /* damping one-pole y[n]=y[n-1]+A(x[n]-y[n-1]) applied causally to the IR */
+    double y = 0;
+    for (int i = 0; i < ilen; i++) {
+        y += (LP_A_Q15 / 32767.0) * (imp[i] - y);
+        imp[i] = sat16((int32_t)y);
+    }
+    /* pick up to 32 significant taps (threshold scan keeps the energy order) */
+    int cnt = 0;
+    int thr = 250;
+    while (cnt < 32 && thr > 0) {
+        for (int i = 0; i < ilen && cnt < 32; i++) {
+            int32_t m = abs(imp[i]);
+            if (m >= thr) { verb_taps[cnt] = imp[i]; verb_idx[cnt] = (uint16_t)i; cnt++; }
+        }
+        thr >>= 1;
+    }
+    while (cnt < 32) { verb_taps[cnt] = 0; verb_idx[cnt] = 0; cnt++; }
+
+    int32_t esum = 0;
+    for (int i = 0; i < 32; i++) esum += abs(verb_taps[i]);
+    if (esum > 12000) {                            /* conservative wet level */
+        for (int i = 0; i < 32; i++) verb_taps[i] = (int16_t)((verb_taps[i] * 12000) / esum);
+    }
+    free(imp); free(tmp);
+}
+
+static inline IRAM_ATTR int16_t verb_run(int16_t x)
+{
+    verb_buf[verb_pos] = x;
+    int32_t acc = 0;
+    for (int i = 0; i < 32; i++) {
+        acc += (int32_t)verb_taps[i] *
+               verb_buf[(verb_pos - 1 - verb_idx[i]) & verb_mask];
+    }
+    verb_pos = (verb_pos + 1) & verb_mask;
+    int16_t wet = sat16(acc >> 15);
+    verb_lp = sat16(verb_lp + mul_q15(LP_A_Q15, wet - verb_lp));
+    return verb_lp;
+}
+
+/* ---------------------------- bypass xfade ---------------------------- */
+static int      xf_cnt;                        /* blocks remaining in fade */
+static bool     xf_to_fx;
+static int16_t  dry_hold[BLOCK_WORDS];         /* last raw input block     */
+
+static inline int16_t xfade_gain(int n)        /* monotone 0..32767 ramp */
+{
+    int32_t t = (int32_t)n * 32767 / XFADE_BLOCKS;
+    return sat16(t);
+}
+
+/* ----------------------------- settings ----------------------------- */
+void dsp_get_settings(dsp_settings_t *dst)
+{
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    *dst = s_set;
+    xSemaphoreGive(s_param_lock);
+}
+
+static void apply_coef(void)
+{
+    dly_fb_q15 = (int16_t)((int32_t)s_set.delay_fb * 32767 / 100 * 9 / 10); /* cap 90% */
+    dly_n = (uint32_t)s_set.delay_ms * SAMPLE_RATE / 1000;
+    if (dly_n > dly_mask) dly_n = dly_mask;
+    cho_inc = (uint32_t)(((double)s_set.chorus_rate_mhz / 1000.0 / SAMPLE_RATE)
+                         * 4294967295.99);
+    cho_depth_q16 = (int32_t)((double)s_set.chorus_depth_us / 1e6
+                              * SAMPLE_RATE * 65536.0 / 2.0);
+    hpf_compute(s_set.hpf_hz ? (float)s_set.hpf_hz : 90.0f);
+}
+
+void dsp_set_field(int field_id, int value)
+{
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    switch (field_id) {
+    case FLD_DELAY_MIX:    s_set.delay_mix       = value; break;
+    case FLD_DELAY_MS:     s_set.delay_ms        = value; break;
+    case FLD_DELAY_FB:     s_set.delay_fb        = value; break;
+    case FLD_CHORUS_MIX:   s_set.chorus_mix      = value; break;
+    case FLD_CHORUS_RATE:  s_set.chorus_rate_mhz = value; break;
+    case FLD_CHORUS_DEPTH: s_set.chorus_depth_us = value; break;
+    case FLD_REVERB_MIX:   s_set.reverb_mix      = value; break;
+    case FLD_HPF:          s_set.hpf_hz          = value; break;
+    case FLD_MASTER:       s_set.master_pct      = value; break;
+    default: break;
+    }
+    apply_coef();
+    xSemaphoreGive(s_param_lock);
+}
+
+void dsp_set_fx(bool on)
+{
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    s_set.fx_on = on;
+    xf_cnt = XFADE_BLOCKS;
+    xf_to_fx = on;
+    xSemaphoreGive(s_param_lock);
+}
+
+/* ------------------------------- init ------------------------------- */
+void dsp_init(void)
+{
+    s_param_lock = xSemaphoreCreateMutex();
+
+    s_set.preset = 0; s_set.fx_on = true;
+    s_set.delay_mix       = CONFIG_DELAY_MIX_PCT_DFLT;
+    s_set.chorus_mix      = CONFIG_CHORUS_MIX_PCT_DFLT;
+    s_set.reverb_mix      = CONFIG_REVERB_MIX_PCT_DFLT;
+    s_set.delay_ms        = CONFIG_DELAY_TIME_MS_DFLT;
+    s_set.delay_fb        = CONFIG_DELAY_FEEDBACK_PCT_DFLT;
+    s_set.chorus_rate_mhz = CONFIG_CHORUS_RATE_MHZ;
+    s_set.chorus_depth_us = CONFIG_CHORUS_DEPTH_US;
+    s_set.hpf_hz          = CONFIG_HPF_CUTOFF_HZ;
+    s_set.master_pct      = CONFIG_OUTPUT_GAIN_PCT;
+
+    dly_buf  = alloc_line((size_t)(0.4f * SAMPLE_RATE), &dly_mask);
+    cho_buf  = alloc_line((size_t)(0.02f * SAMPLE_RATE), &cho_mask);
+    verb_buf = alloc_line((size_t)(TAP_DELAY_S * SAMPLE_RATE) + 24000, &verb_mask);
+
+    verb_build();
+    apply_coef();
+    tuner_init();
+}
+
+uint16_t dsp_peak_in(void)  { return s_peak_in;  }
+uint16_t dsp_peak_out(void) { return s_peak_out; }
+
+/* ========================== block processor ========================= */
+void IRAM_ATTR dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on)
+{
+    static int16_t mono[BLOCK_SAMPLES];
+    static int16_t wd_[BLOCK_SAMPLES], wc_[BLOCK_SAMPLES], wv_[BLOCK_SAMPLES];
+
+    /* ---- stage A: sum to mono, meter, HPF, limiter; feed tuner PRE-FX --- */
+    uint32_t peak = 0;
+    for (int i = 0; i < BLOCK_SAMPLES; i++) {
+        int32_t m = ((int32_t)in[2*i] + in[2*i+1]) >> 1;
+        uint32_t a = m < 0 ? -(uint32_t)m : (uint32_t)m;
+        if (a > peak) peak = a;
+        mono[i] = soft_clip(hpf_run((int16_t)m));
+    }
+    s_peak_in = (uint16_t)peak;
+#if CONFIG_TUNER_ENABLED
+    if (tuner_on) tuner_push_frame(mono);
+#else
+    (void)tuner_on;
+#endif
+
+    /* ---- stage B: effect sends (all read-only wrt s_set fields used here) */
+    for (int i = 0; i < BLOCK_SAMPLES; i++) {
+        wd_[i] = delay_run(mono[i]);
+        wc_[i] = chorus_run(mono[i]);
+        wv_[i] = verb_run(mono[i]);
+    }
+
+    /* ---- stage C: mix, master gain, bypass crossfade ---- */
+    const int32_t third = 10923;          /* ~32767/3: unity when all at 100% */
+    /* snapshot per block so a UI write cannot tear mid-fade */
+    int32_t gd = mul_q15(s_set.delay_mix  * 327, third);   /* Q15 wet weights */
+    int32_t gc = mul_q15(s_set.chorus_mix * 327, third);
+    int32_t gv = mul_q15(s_set.reverb_mix * 327, third);
+    int32_t mg = s_set.master_pct * 327;                   /* Q15 master gain */
+    bool fxon = s_set.fx_on;
+
+    uint32_t peak_o = 0;
+    for (int i = 0; i < BLOCK_SAMPLES; i++) {
+        int32_t wet = mul_q15(wd_[i], gd) + mul_q15(wc_[i], gc) + mul_q15(wv_[i], gv);
+        wet = sat16(wet);
+        /* stereo spread: right channel gets 80% of the wet bus (width cue) */
+        int32_t ol  = mul_q15(mono[i] + wet, mg);
+        int32_t orr = mul_q15(mono[i] + sat16(wet - mul_q15(wet, 6554)), mg);
+
+        if (xf_cnt > 0) {                  /* click-free bypass transition */
+            int16_t g = xfade_gain(XFADE_BLOCKS - xf_cnt + 1);
+            int16_t k = sat16(32767 - g);
+            int16_t fg = xf_to_fx ? g : k;      /* weight of processed path */
+            int16_t dg = xf_to_fx ? k : g;      /* weight of dry path       */
+            ol  = mul_q15(ol,  fg) + mul_q15(dry_hold[2*i],   dg);
+            orr = mul_q15(orr, fg) + mul_q15(dry_hold[2*i+1], dg);
+        } else if (!fxon) {
+            ol = in[2*i]; orr = in[2*i+1];
+        }
+        out[2*i]   = sat16(ol);
+        out[2*i+1] = sat16(orr);
+        uint32_t ao = (uint32_t)(ol < 0 ? -ol : ol);
+        if (ao > peak_o) peak_o = ao;
+    }
+    if (xf_cnt > 0) xf_cnt--;
+    memcpy(dry_hold, in, sizeof(dry_hold));
+    s_peak_out = (uint16_t)peak_o;
+}
