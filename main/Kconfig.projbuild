@@ -15,7 +15,8 @@ config SAMPLE_RATE
 config AUDIO_FRAME_SAMPLES
     int "Samples per processing block (per channel)"
     default 128
-    help Ring-block size. 128 @ 48 kHz = ~2.66 ms granularity.
+    help
+        Ring-block size. 128 @ 48 kHz = ~2.66 ms granularity.
 
 config TUNER_ENABLED
     bool "Enable chromatic tuner"
@@ -25,13 +26,15 @@ config TUNER_ENABLED
 config HPF_CUTOFF_HZ
     int "High-pass cutoff (Hz), suppresses body/soundhole feedback"
     default 80
-    help Stored in settings as kHz*10 (uint8 field): 80 -> 800. Valid UI
+    help
+        Stored in settings as kHz*10 (uint8 field): 80 -> 800. Valid UI
          choices are OFF/80/90/100 Hz; any other value is clamped by the DSP.
 
 config LIMITER_THRESHOLD
     hex "Soft-clip threshold (Q15). 0x7fff = full scale"
     default 0x5cc0
-    help Transients above ~0.36 FS are softly compressed (anti-larsen).
+    help
+        Transients above ~0.36 FS are softly compressed (anti-larsen).
 
 config OUTPUT_GAIN_PCT
     int "Master output gain in percent (conservative vs. feedback)"

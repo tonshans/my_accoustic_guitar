@@ -13,8 +13,10 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <math.h>
+#include <stdio.h>
 #include "dsp.h"
 #include "tuner.h"
+#include "audio_pipe.h"
 #include "board.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
@@ -26,6 +28,7 @@
 #define TAP_DELAY_S      0.04f     /* reverb pre-delay        */
 #define CHORUS_BASE_US   8000      /* chorus nominal delay    */
 #define XFADE_BLOCKS     1         /* bypass fade = 1 block (2.66 ms) */
+#define CADENCE_TICK_US    (BLOCK_PERIOD_US - 200)  /* wake 200us before deadline */
 
 static dsp_settings_t s_set;
 static SemaphoreHandle_t s_param_lock;
@@ -33,17 +36,22 @@ static SemaphoreHandle_t s_param_lock;
 static volatile uint16_t s_peak_in, s_peak_out;
 volatile uint32_t g_dsp_beat;              /* bumped once per processed block */
 
-/* Block-cadence helpers used by the DSP task (created in dsp_start_task).
- * The cadence timer must use ESP_TIMER_ISR dispatch: with TASK dispatch the
- * expiry runs on the esp_timer task (priority 22 on core 0 — same priority as
- * the DSP task, round-robin), which adds jitter to the audio block clock.
- * From ISR dispatch we only touch a binary semaphore + portYIELD, so it is
- * safe at audio priority. */
+/* Block-cadence wake-up for the DSP task (created in dsp_start_task).
+ * A PERIODIC timer with ISR dispatch: the expiry callback runs directly from
+ * the hardware-timer ISR (affinitised to CPU0 by default), so the audio block
+ * clock never depends on the esp_timer daemon task being scheduled. The ISR
+ * reschedules itself and releases the DSP task's binary semaphore; both
+ * operations are ISR-safe. */
 static SemaphoreHandle_t s_wake_sem;
 static esp_timer_handle_t s_cadence_timer;
 
+/* One-shot re-arm: esp_timer_stop() is NOT ISR-safe, so instead of a periodic
+ * timer we re-start the one-shot from inside its own expiry callback (both
+ * calls happen in ISR context, where start-from-callback is explicitly
+ * allowed). The 200 us pre-sleep margin below keeps the arm cheap. */
 static void IRAM_ATTR cadence_timer_cb(void *arg)
 {
+    esp_timer_start_once(s_cadence_timer, CADENCE_TICK_US);
     BaseType_t hp = pdFALSE;
     xSemaphoreGiveFromISR(s_wake_sem, &hp);
     if (hp) portYIELD_FROM_ISR(hp);
@@ -449,6 +457,17 @@ void dsp_init(void)
     tuner_init();
 }
 
+/* Block scratch buffers: file-scope so they can live in internal RAM via
+ * heap_caps_malloc (plain `static` arrays would land in .bss, which on this
+ * build sits in PSRAM-mapped address space — unacceptable inside the core-0
+ * audio path). Sizes are fixed at compile time, allocated once in
+ * dsp_start_task(), never reallocated while the task runs. */
+static int32_t *raw_i, *raw_o;        /* interleaved 32-bit DMA slots   */
+static int16_t *q15_i, *q15_o;        /* interleaved stereo Q15 frames  */
+static int16_t *q15_m;                /* mono post-front-end Q15        */
+static int16_t s_wd[BLOCK_SAMPLES], s_wc[BLOCK_SAMPLES], s_wv[BLOCK_SAMPLES];
+                                      /* wet-send scratch (stage output)*/
+
 /* Forward declaration: the core-0 block-cadence task is defined below. */
 static void dsp_task(void *arg);
 
@@ -492,17 +511,6 @@ void dsp_reset_timing_stats(void)
     g_dsp_overruns = 0;
 }
 
-/* Block scratch buffers: file-scope so they can live in internal RAM via
- * heap_caps_malloc (plain `static` arrays would land in .bss, which on this
- * build sits in PSRAM-mapped address space — unacceptable inside the core-0
- * audio path). Sizes are fixed at compile time, allocated once in
- * dsp_start_task(), never reallocated while the task runs. */
-static int32_t *raw_i, *raw_o;        /* interleaved 32-bit DMA slots   */
-static int16_t *q15_i, *q15_o;        /* interleaved stereo Q15 frames  */
-static int16_t *q15_m;                /* mono post-front-end Q15        */
-static int16_t s_wd[BLOCK_SAMPLES], s_wc[BLOCK_SAMPLES], s_wv[BLOCK_SAMPLES];
-                                      /* wet-send scratch (stage output)*/
-
 /* PCM1808/MAX98357A are configured as I2S masters with 32-bit Philips slots:
  * the ADC right-justifies its 24 valid bits in the slot (bits 3..26), so we
  * take bits 14..29 for a Q15 value that sits 2 dB below full scale — exactly
@@ -535,6 +543,7 @@ static void dsp_task(void *arg)
     /* Fade-in over the first few blocks so the exciter never gets a step. */
     int warm = 4;
     uint32_t deadline_us = esp_timer_get_time() + BLOCK_PERIOD_US;
+    bool armed = false;                       /* cadence timer currently pending */
 
     for (;;) {
         if (gtr_ring_read_timed(&g_audio.in_ring, raw_i, BYTES_PER_BLOCK,
@@ -573,18 +582,29 @@ static void dsp_task(void *arg)
         gtr_ring_write(&g_audio.out_ring, raw_o, BYTES_PER_BLOCK);
         g_dsp_beat++;
 
-        /* Hold the block cadence: absolute-time sleep keeps long-term drift
-         * at zero even if individual iterations jitter. The one-shot timer
-         * uses ISR dispatch (see cadence_timer_cb) so the wake-up does not
-         * depend on the esp_timer task being scheduled. */
+        /* Hold the block cadence (absolute-time: zero long-term drift).
+         * Arm the ISR-dispatched one-shot 200 us before the deadline; the
+         * expiry callback releases our semaphore AND self-re-arms, so after
+         * the first arm the loop just waits. If the read timeout consumed
+         * the whole period (RX stalled), the timer was never armed or has
+         * no pending give — fall back to a plain timed wait to stay alive. */
         deadline_us += BLOCK_PERIOD_US;
         int64_t now = esp_timer_get_time();
-        if (deadline_us - now > 200) {             /* only sleep when we have margin */
-            esp_timer_start_once(s_cadence_timer, deadline_us - now - 200);
+        if (deadline_us - now > 500) {
+            if (!armed) {
+                esp_timer_start_once(s_cadence_timer, deadline_us - now - 200);
+                armed = true;
+            }
             xSemaphoreTake(s_wake_sem, portMAX_DELAY);
-            esp_timer_stop(s_cadence_timer);       /* disarm; one-shot may already have fired */
-        } else if (now - deadline_us > BLOCK_PERIOD_US * 4) {
-            deadline_us = now;                     /* resync after a big stall */
+            armed = false;                    /* expiry ran (or raced); re-arm next pass */
+        } else if (now - deadline_us > 4 * BLOCK_PERIOD_US) {
+            deadline_us = now;                /* resync after a big stall */
+            esp_timer_stop(s_cadence_timer);  /* task ctx: stop is safe here */
+            armed = false;
+        } else {
+            /* behind schedule but within tolerance: process back-to-back */
+            armed = false;
+            esp_timer_stop(s_cadence_timer);
         }
     }
 }

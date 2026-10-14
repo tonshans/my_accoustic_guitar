@@ -23,7 +23,7 @@ typedef struct {
     uint16_t peak;        /* Q15 input peak of last frame            */
     float    freq;        /* detected fundamental (Hz), 0 = not ready*/
     int8_t   cents;       /* -50..+50 deviation from nearest note    */
-    char     note[8];     /* e.g. "A2"; "--" while gated off         */
+    char     note[12];     /* e.g. "A2"; "--" while gated off         */
     bool     in_range;    /* |cents| <= IN_TUNE_CENTS                */
 } tuner_result_t;
 

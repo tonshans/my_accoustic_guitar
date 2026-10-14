@@ -1,0 +1,28 @@
+# main component — Guitar DSP + Tuner + local UI (Phase 1)
+idf_component_register(
+    SRCS
+        "main.c"
+        "audio/ringbuffer.c"
+        "audio/audio_pipe.c"
+        "dsp/dsp.c"
+        "dsp/tuner.c"
+        "dsp/presets.c"
+        "ui/ssd1306.c"
+        "ui/encoder.c"
+        "ui/battery.c"
+        "ui/ui.c"
+    INCLUDE_DIRS
+        "."
+        "audio"
+        "dsp"
+        "ui"
+    PRIV_REQUIRES
+        esp_driver_i2s
+        esp_driver_i2c
+        esp_driver_gpio
+        esp_adc
+        nvs_flash
+        esp_timer
+        esp_hw_support
+        spi_flash
+)
