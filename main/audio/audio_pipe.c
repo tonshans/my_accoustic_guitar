@@ -12,6 +12,13 @@
 
 static const char *TAG = "audio_pipe";
 
+/* gtr_ring_init() returns bool (it is called from the IRAM RX path, where
+ * esp_err_t logging would be inappropriate); wrap it for ESP_RETURN_ON_ERROR. */
+static esp_err_t ring_init_or_fail(gtr_ring_t *ring)
+{
+    return gtr_ring_init(ring) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 audio_pipe_t g_audio;
 
 static i2s_chan_handle_t rx_chan;

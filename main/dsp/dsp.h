@@ -55,6 +55,13 @@ void dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on);
  * output was forced to silence (should stay at 0 during normal playing). */
 extern volatile uint32_t g_dsp_overruns;
 
+/* Per-block stage-time statistics measured on core 0 (microseconds):
+ * last / max-since-reset / EWMA. Display-only, read lock-free from core 1. */
+extern volatile uint32_t g_dsp_us_last;
+extern volatile uint32_t g_dsp_us_max;
+extern volatile uint32_t g_dsp_us_avg;
+void dsp_reset_timing_stats(void);
+
 /* Bumped once per processed block — health watchdog for core 1. */
 extern volatile uint32_t g_dsp_beat;
 

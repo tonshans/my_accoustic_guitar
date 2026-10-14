@@ -11,6 +11,7 @@
  */
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <math.h>
 #include "dsp.h"
 #include "tuner.h"
@@ -31,16 +32,28 @@ static SemaphoreHandle_t s_param_lock;
 static volatile uint16_t s_peak_in, s_peak_out;
 volatile uint32_t g_dsp_beat;              /* bumped once per processed block */
 
-/* Block-cadence helpers used by the DSP task (created in dsp_start_task). */
+/* Block-cadence helpers used by the DSP task (created in dsp_start_task).
+ * The cadence timer must use ESP_TIMER_ISR dispatch: with TASK dispatch the
+ * expiry runs on the esp_timer task (priority 22 on core 0 — same priority as
+ * the DSP task, round-robin), which adds jitter to the audio block clock.
+ * From ISR dispatch we only touch a binary semaphore + portYIELD, so it is
+ * safe at audio priority. */
 static SemaphoreHandle_t s_wake_sem;
-static esp_timer_handle_t s_brief_timer;
+static esp_timer_handle_t s_cadence_timer;
 
-static void IRAM_ATTR brief_timer_cb(void *arg)
+static void IRAM_ATTR cadence_timer_cb(void *arg)
 {
     BaseType_t hp = pdFALSE;
     xSemaphoreGiveFromISR(s_wake_sem, &hp);
     if (hp) portYIELD_FROM_ISR(hp);
 }
+
+/* Live per-block timing stats for the OLED monitor line / host tests.
+ * Updated from the core-0 DSP task, read lock-free from core 1 (uint32 torn
+ * reads are harmless here — display-only values). */
+volatile uint32_t g_dsp_us_max;        /* worst-case stage time this second   */
+volatile uint32_t g_dsp_us_last;       /* last processed block's stage time   */
+volatile uint32_t g_dsp_us_avg;        /* EWMA (~time constant 64 blocks)     */
 
 /* ------------------------- helpers -------------------------- */
 static inline int32_t mul_q15(int32_t x, int32_t y) { return (x * y) >> 15; }
@@ -86,9 +99,13 @@ static void hpf_compute(float fc)
     s_hpf_c.a2 = sat16(((1.0f - alpha)    / a0) * 32767.0f);
 }
 
+/* Cached flag derived from the per-block snapshot (see dsp_snapshot_params):
+ * avoids reading the settings struct inside the sample loop. */
+static bool s_hpf_bypass;
+
 static inline IRAM_ATTR int16_t hpf_run(int16_t x)
 {
-    if (!s_set.hpf_hz) return x;
+    if (s_hpf_bypass) return x;
     const biquad_t *c = &s_hpf_c;
     int32_t y = mul_q15(c->b0, x) + s_hpf_z[0];
     s_hpf_z[0] = mul_q15(c->b1, x) - mul_q15(c->a1, y) + s_hpf_z[1];
@@ -271,11 +288,28 @@ static int      xf_cnt;                        /* blocks remaining in fade */
 static bool     xf_to_fx;
 static int16_t  dry_hold[BLOCK_WORDS];         /* last raw input block     */
 
+/* Per-block latched copies (written only by the DSP task inside
+ * dsp_snapshot_params(); consumed by dsp_stage_output()). The originals are
+ * owned by the UI task, which may start a new fade at any time — the audio
+ * path must never observe that mid-block. */
+static int      xf_cnt_snap;
+static bool     xf_to_fx_snap;
+
+/* Crossfade weights are plain integers scaled by XFADE_BLOCKS so the hot loop
+ * never divides: gain for step k of N is (k * 32767 / N), precomputed once. */
+static int16_t  xf_gains[XFADE_BLOCKS + 1];
+
+static void xfade_tables_init(void)
+{
+    for (int k = 0; k <= XFADE_BLOCKS; k++)
+        xf_gains[k] = sat16((int32_t)k * 32767 / XFADE_BLOCKS);
+}
+
 static inline int16_t xfade_gain(int n)        /* monotone 0..32767 ramp */
 {
-    int32_t t = (int32_t)n * 32767 / XFADE_BLOCKS;
-    if (t > 32767) t = 32767;
-    return sat16(t);
+    if (n < 0) n = 0;
+    if (n > XFADE_BLOCKS) n = XFADE_BLOCKS;
+    return xf_gains[n];
 }
 
 /* ----------------------------- settings ----------------------------- */
@@ -283,6 +317,25 @@ void dsp_get_settings(dsp_settings_t *dst)
 {
     xSemaphoreTake(s_param_lock, portMAX_DELAY);
     *dst = s_set;
+    xSemaphoreGive(s_param_lock);
+}
+
+/* Runtime copy of the settings used by the hot path. The UI task writes
+ * s_set under s_param_lock; the DSP task snapshots it into s_rt once per
+ * block (under the same lock) BEFORE running the stages, so no field can
+ * ever tear mid-block and apply_coef() output is always consistent with
+ * the gains read during dsp_stage_output(). */
+static dsp_settings_t s_rt;
+
+static void IRAM_ATTR dsp_snapshot_params(void)
+{
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    s_rt = s_set;
+    /* also latch the bypass-fade state so stage_output never touches vars
+     * written by the UI task mid-block */
+    xf_cnt_snap   = xf_cnt;
+    xf_to_fx_snap = xf_to_fx;
+    s_hpf_bypass  = (s_set.hpf_hz == 0);
     xSemaphoreGive(s_param_lock);
 }
 
@@ -320,9 +373,11 @@ void dsp_set_field(int field_id, int value)
 void dsp_set_fx(bool on)
 {
     xSemaphoreTake(s_param_lock, portMAX_DELAY);
-    s_set.fx_on = on;
-    xf_cnt = XFADE_BLOCKS;
-    xf_to_fx = on;
+    if (s_set.fx_on != on) {             /* don't restart a fade that isn't needed */
+        s_set.fx_on = on;
+        xf_cnt = XFADE_BLOCKS;
+        xf_to_fx = on;
+    }
     xSemaphoreGive(s_param_lock);
 }
 
@@ -354,6 +409,9 @@ void dsp_set_preset(int idx)
 /* ------------------------------- init ------------------------------- */
 void dsp_init(void)
 {
+    /* The DSP task snapshots the settings every block, so the lock must
+     * already exist when dsp_init() returns. Created here (not in
+     * dsp_start_task) to keep an init-order hazard out of main.c. */
     s_param_lock = xSemaphoreCreateMutex();
 
     s_set.preset = 0; s_set.fx_on = true;
@@ -370,19 +428,22 @@ void dsp_init(void)
     dly_buf  = alloc_line((size_t)(0.4f * SAMPLE_RATE), &dly_mask);
     cho_buf  = alloc_line((size_t)(0.02f * SAMPLE_RATE), &cho_mask);
     verb_buf = alloc_line((size_t)(TAP_DELAY_S * SAMPLE_RATE) + 24000, &verb_mask);
+    assert(dly_buf && cho_buf && verb_buf);   /* internal-RAM lines are fatal */
 
+    xfade_tables_init();
     verb_build();
     apply_coef();
+    s_rt = s_set;                        /* prime the runtime snapshot */
     tuner_init();
 }
 
 void dsp_start_task(void)
 {
     s_wake_sem = xSemaphoreCreateBinary();
-    const esp_timer_create_args_t ta = { .callback = brief_timer_cb,
-                                         .dispatch_method = ESP_TIMER_TASK,
+    const esp_timer_create_args_t ta = { .callback = cadence_timer_cb,
+                                         .dispatch_method = ESP_TIMER_ISR,
                                          .name = "dsp_cadence" };
-    ESP_ERROR_CHECK(esp_timer_create(&ta, &s_brief_timer));
+    ESP_ERROR_CHECK(esp_timer_create(&ta, &s_cadence_timer));
     xTaskCreatePinnedToCore(dsp_task, "dsp", 4096, NULL, PRIO_DSP, NULL, CORE_AUDIO);
 }
 
@@ -394,11 +455,19 @@ bool dsp_task_alive(void)
 uint16_t dsp_peak_in(void)  { return s_peak_in;  }
 uint16_t dsp_peak_out(void) { return s_peak_out; }
 
+void dsp_reset_timing_stats(void)
+{
+    g_dsp_us_max = 0;
+    g_dsp_overruns = 0;
+}
+
 /* ------------------------- DSP task (core 0) -------------------------
  * Owns the audio block clock: one iteration per BLOCK_PERIOD_US. Reads a raw
- * int32 stereo block from the RX ring, converts to Q15, runs the two pipeline
- * stages under a hard deadline watch, and hands the result to the TX ring.
- * No allocations, no logging, no flash access in this loop. */
+ * int32 stereo block from the RX ring, converts to Q15, snapshots the UI
+ * settings once per block, runs the two pipeline stages under a hard deadline
+ * watch, and hands the result to the TX ring. No allocations, no logging, no
+ * flash access in this loop. */
+static void dsp_task(void *arg);
 /* PCM1808/MAX98357A are configured as I2S masters with 32-bit Philips slots:
  * the ADC right-justifies its 24 valid bits in the slot (bits 3..26), so we
  * take bits 14..29 for a Q15 value that sits 2 dB below full scale — exactly
@@ -441,6 +510,10 @@ static void dsp_task(void *arg)
         }
         convert_q15(raw_i, q15_i, BLOCK_SAMPLES);
 
+        /* Snapshot UI-written settings once per block: no field can tear
+         * mid-block and coefficients stay consistent with the gains below. */
+        dsp_snapshot_params();
+
         int64_t t0 = esp_timer_get_time();
         bool tuner_on = tuner_is_enabled();
         dsp_stage_input(q15_i, q15_m, BLOCK_SAMPLES, tuner_on);
@@ -450,6 +523,10 @@ static void dsp_task(void *arg)
         if (elapsed > BLOCK_PERIOD_US) {           /* §8 failure handling */
             dsp_fail_silence(q15_o);               /* zero output, count it */
         }
+        g_dsp_us_last = (uint32_t)elapsed;
+        if ((uint32_t)elapsed > g_dsp_us_max) g_dsp_us_max = (uint32_t)elapsed;
+        g_dsp_us_avg += ((uint32_t)elapsed - g_dsp_us_avg) / 64;   /* EWMA */
+
         if (warm > 0) {                            /* startup fade-in ramp */
             int g = (4 - warm + 1) * 8192;         /* ~0.25..1.0 Q15 */
             for (int i = 0; i < BLOCK_WORDS; i++)
@@ -461,11 +538,13 @@ static void dsp_task(void *arg)
         g_dsp_beat++;
 
         /* Hold the block cadence: absolute-time sleep keeps long-term drift
-         * at zero even if individual iterations jitter. */
+         * at zero even if individual iterations jitter. The one-shot timer
+         * uses ISR dispatch (see cadence_timer_cb) so the wake-up does not
+         * depend on the esp_timer task being scheduled. */
         deadline_us += BLOCK_PERIOD_US;
         int64_t now = esp_timer_get_time();
         if (deadline_us - now > 200) {             /* only sleep when we have margin */
-            esp_timer_start_once(s_brief_timer, deadline_us - now - 200);
+            esp_timer_start_once(s_cadence_timer, deadline_us - now - 200);
             xSemaphoreTake(s_wake_sem, portMAX_DELAY);
         } else if (now - deadline_us > BLOCK_PERIOD_US * 4) {
             deadline_us = now;                     /* resync after a big stall */
@@ -514,14 +593,13 @@ void IRAM_ATTR dsp_stage_output(const int16_t *mono, const int16_t *in,
         wv[i] = verb_run(mono[i]);
     }
 
-    /* ---- wet/dry mixer + master gain ---- */
+    /* ---- wet/dry mixer + master gain (all from the per-block snapshot) ---- */
     const int32_t third = 10923;          /* ~32767/3: unity when all at 100% */
-    /* snapshot per block so a UI write cannot tear mid-block */
-    int32_t gd = mul_q15(s_set.delay_mix  * 327, third);   /* Q15 wet weights */
-    int32_t gc = mul_q15(s_set.chorus_mix * 327, third);
-    int32_t gv = mul_q15(s_set.reverb_mix * 327, third);
-    int32_t mg = s_set.master_pct * 327;                   /* Q15 master gain */
-    bool fxon = s_set.fx_on;
+    int32_t gd = mul_q15(s_rt.delay_mix  * 327, third);   /* Q15 wet weights */
+    int32_t gc = mul_q15(s_rt.chorus_mix * 327, third);
+    int32_t gv = mul_q15(s_rt.reverb_mix * 327, third);
+    int32_t mg = s_rt.master_pct * 327;                   /* Q15 master gain */
+    bool fxon = s_rt.fx_on;
 
     uint32_t peak_o = 0;
     for (int i = 0; i < n; i++) {
@@ -531,11 +609,11 @@ void IRAM_ATTR dsp_stage_output(const int16_t *mono, const int16_t *in,
         int32_t ol  = mul_q15(mono[i] + wet, mg);
         int32_t or_ = mul_q15(mono[i] + sat16(wet - mul_q15(wet, 6554)), mg);
 
-        if (xf_cnt > 0) {                  /* click-free bypass transition */
-            int16_t g = xfade_gain(XFADE_BLOCKS - xf_cnt + 1);
+        if (xf_cnt_snap > 0) {             /* click-free bypass transition */
+            int16_t g = xfade_gain(XFADE_BLOCKS - xf_cnt_snap + 1);
             int16_t k = sat16(32767 - g);
-            int16_t fg = xf_to_fx ? g : k;      /* weight of processed path */
-            int16_t dg = xf_to_fx ? k : g;      /* weight of dry path       */
+            int16_t fg = xf_to_fx_snap ? g : k;      /* weight of processed path */
+            int16_t dg = xf_to_fx_snap ? k : g;      /* weight of dry path       */
             ol  = mul_q15(ol,  fg) + mul_q15(dry_hold[2*i],   dg);
             or_ = mul_q15(or_, fg) + mul_q15(dry_hold[2*i+1], dg);
         } else if (!fxon) {                /* true bypass: raw ADC frames */
@@ -546,7 +624,7 @@ void IRAM_ATTR dsp_stage_output(const int16_t *mono, const int16_t *in,
         uint32_t ao = (uint32_t)(ol < 0 ? -ol : ol);
         if (ao > peak_o) peak_o = ao;
     }
-    if (xf_cnt > 0) xf_cnt--;
+    if (xf_cnt_snap > 0) xf_cnt_snap--;
     memcpy(dry_hold, in, n * 2 * sizeof(int16_t));
     s_peak_out = (uint16_t)peak_o;
 }
