@@ -151,7 +151,11 @@ static void fmt_val(char *b, size_t n, const row_t *r, int v)
     case FLD_DELAY_MS:      snprintf(b, n, "%dms", v); break;
     case FLD_CHORUS_RATE:   snprintf(b, n, "%d.%02dHz", v/1000, (v%1000)/10); break;
     case FLD_CHORUS_DEPTH:  snprintf(b, n, "%uus", v); break;
-    case PF_HPF_SEL:        snprintf(b, n, v ? "%dHz" : "OFF", v * 10 + 70); break;
+    case PF_HPF_SEL: {                                  /* v: 0..3 sel index */
+        if (v == 0) snprintf(b, n, "OFF");
+        else        snprintf(b, n, "%dHz", v * 10 + 70);
+        break;
+    }
     default:                snprintf(b, n, "%d", v); break;
     }
 }
@@ -164,7 +168,7 @@ static void row_set(const row_t *r, int v)
 
 static void render_pages(bool fx_on)
 {
-    char b[20];
+    char b[48];
     switch (s_page) {
     case PAGE_HOME: {
         draw_header("GTR FX");
@@ -231,6 +235,8 @@ static void render_pages(bool fx_on)
         oled_str(2, 6, t.in_range ? "*IN TUNE*" : b, false);
         break;
     }
+    default:                       /* PAGE_COUNT sentinel — unreachable */
+        break;
     }
 }
 

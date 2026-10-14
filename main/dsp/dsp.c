@@ -442,7 +442,7 @@ void dsp_init(void)
     s_set.delay_fb        = CONFIG_DELAY_FEEDBACK_PCT_DFLT;
     s_set.chorus_rate_mhz = CONFIG_CHORUS_RATE_MHZ;
     s_set.chorus_depth_us = CONFIG_CHORUS_DEPTH_US;
-    s_set.hpf_hz          = CONFIG_HPF_CUTOFF_HZ * 10;   /* kHz*10 encoding */
+    s_set.hpf_hz          = (uint8_t)(CONFIG_HPF_CUTOFF_HZ * 10); /* kHz*10 enc. */
     s_set.master_pct      = CONFIG_OUTPUT_GAIN_PCT;
 
     dly_buf  = alloc_line((size_t)(0.4f * SAMPLE_RATE), &dly_mask);

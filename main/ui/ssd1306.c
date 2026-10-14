@@ -31,7 +31,7 @@ bool ssd1306_init(void)
         .i2c_port          = OLED_I2C_PORT,
         .sda_io_num        = OLED_SDA_PIN,
         .scl_io_num        = OLED_SCL_PIN,
-        .clk_source        = I2C_SRC_CLK_APB,
+        .clk_source        = I2C_CLK_SRC_DEFAULT,  /* XTAL on ESP32-S3 */
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
@@ -77,17 +77,13 @@ void ssd1306_clear(void)
 
 void ssd1306_flush(void)
 {
-    /* one DMA buffer reused: [0x40 header | 128 px] per page */
-    _Static_assert(sizeof(fb) + 1 <= 1024, "oled txbuf");
-    static uint8_t txbuf[sizeof(fb) + 1];
-    txbuf[0] = 0x40;
-    memcpy(txbuf + 1, fb, sizeof(fb));
+    /* page addressing: one [0x40 header | 128 px] transfer per page */
+    uint8_t b[1 + OLED_W];
 
     for (int p = 0; p < PAGES; p++) {
         cmd(0xB0 | p);
         cmd(0x00 | (p & 0x0F));         /* lower col (page mode wraps)      */
         cmd(0x10);                      /* upper col = 0                    */
-        uint8_t b[1 + OLED_W];
         b[0] = 0x40;
         memcpy(b + 1, fb[p], OLED_W);
         if (i2c_master_transmit(dev, b, sizeof(b), 100) != ESP_OK) return;
