@@ -19,15 +19,27 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "esp_timer.h"
 
 #define TAP_DELAY_S      0.04f     /* reverb pre-delay        */
 #define CHORUS_BASE_US   8000      /* chorus nominal delay    */
-#define XFADE_BLOCKS     1         /* bypass fade ~= 2.9 ms   */
+#define XFADE_BLOCKS     1         /* bypass fade = 1 block (2.66 ms) */
 
 static dsp_settings_t s_set;
 static SemaphoreHandle_t s_param_lock;
 
 static volatile uint16_t s_peak_in, s_peak_out;
+
+/* Block-cadence helpers used by the DSP task (created in dsp_start_task). */
+static SemaphoreHandle_t s_wake_sem;
+static esp_timer_handle_t s_brief_timer;
+
+static void IRAM_ATTR brief_timer_cb(void *arg)
+{
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR(s_wake_sem, &hp);
+    if (hp) portYIELD_FROM_ISR(hp);
+}
 
 /* ------------------------- helpers -------------------------- */
 static inline int32_t mul_q15(int32_t x, int32_t y) { return (x * y) >> 15; }
@@ -240,6 +252,19 @@ static inline IRAM_ATTR int16_t verb_run(int16_t x)
     return verb_lp;
 }
 
+/* ------------------- failure handling (ARCHITECTURE.md §8) -------------------
+ * If a processed block ever takes longer than BLOCK_PERIOD_US to compute, the
+ * DSP task cannot keep up with the I2S block clock: we zero the output buffer
+ * (safe silence instead of loud garbage), count the overrun for the UI/monitor,
+ * and resynchronize by draining one stale input block. */
+volatile uint32_t g_dsp_overruns;
+
+static void IRAM_ATTR dsp_fail_silence(int16_t *out)
+{
+    memset(out, 0, BLOCK_SAMPLES * 2 * sizeof(int16_t));
+    g_dsp_overruns++;
+}
+
 /* ---------------------------- bypass xfade ---------------------------- */
 static int      xf_cnt;                        /* blocks remaining in fade */
 static bool     xf_to_fx;
@@ -248,6 +273,7 @@ static int16_t  dry_hold[BLOCK_WORDS];         /* last raw input block     */
 static inline int16_t xfade_gain(int n)        /* monotone 0..32767 ramp */
 {
     int32_t t = (int32_t)n * 32767 / XFADE_BLOCKS;
+    if (t > 32767) t = 32767;
     return sat16(t);
 }
 
@@ -268,7 +294,7 @@ static void apply_coef(void)
                          * 4294967295.99);
     cho_depth_q16 = (int32_t)((double)s_set.chorus_depth_us / 1e6
                               * SAMPLE_RATE * 65536.0 / 2.0);
-    hpf_compute(s_set.hpf_hz ? (float)s_set.hpf_hz : 90.0f);
+    hpf_compute(s_set.hpf_hz ? (float)s_set.hpf_hz : 80.0f);
 }
 
 void dsp_set_field(int field_id, int value)
@@ -299,6 +325,31 @@ void dsp_set_fx(bool on)
     xSemaphoreGive(s_param_lock);
 }
 
+void dsp_apply_settings(const dsp_settings_t *src)
+{
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    bool fx_changed = (src->fx_on != s_set.fx_on);
+    s_set = *src;
+    apply_coef();
+    if (fx_changed) { xf_cnt = XFADE_BLOCKS; xf_to_fx = src->fx_on; }
+    xSemaphoreGive(s_param_lock);
+}
+
+bool dsp_get_fx(void)
+{
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    bool v = s_set.fx_on;
+    xSemaphoreGive(s_param_lock);
+    return v;
+}
+
+void dsp_set_preset(int idx)
+{
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    s_set.preset = (int8_t)idx;
+    xSemaphoreGive(s_param_lock);
+}
+
 /* ------------------------------- init ------------------------------- */
 void dsp_init(void)
 {
@@ -324,40 +375,135 @@ void dsp_init(void)
     tuner_init();
 }
 
+void dsp_start_task(void)
+{
+    s_wake_sem = xSemaphoreCreateBinary();
+    const esp_timer_create_args_t ta = { .callback = brief_timer_cb,
+                                         .dispatch_method = ESP_TIMER_TASK,
+                                         .name = "dsp_cadence" };
+    ESP_ERROR_CHECK(esp_timer_create(&ta, &s_brief_timer));
+    xTaskCreatePinnedToCore(dsp_task, "dsp", 4096, NULL, PRIO_DSP, NULL, CORE_AUDIO);
+}
+
 uint16_t dsp_peak_in(void)  { return s_peak_in;  }
 uint16_t dsp_peak_out(void) { return s_peak_out; }
 
-/* ========================== block processor ========================= */
-void IRAM_ATTR dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on)
+/* ------------------------- DSP task (core 0) -------------------------
+ * Owns the audio block clock: one iteration per BLOCK_PERIOD_US. Reads a raw
+ * int32 stereo block from the RX ring, converts to Q15, runs the two pipeline
+ * stages under a hard deadline watch, and hands the result to the TX ring.
+ * No allocations, no logging, no flash access in this loop. */
+static void IRAM_ATTR convert_int32_back(const int16_t *src, int32_t *dst, size_t words)
 {
-    static int16_t mono[BLOCK_SAMPLES];
-    static int16_t wd_[BLOCK_SAMPLES], wc_[BLOCK_SAMPLES], wv_[BLOCK_SAMPLES];
+    /* Q15 -> left-justified 32-bit slot (<<11 matches convert_q15 headroom) */
+    for (size_t i = 0; i < words; i++) dst[i] = (int32_t)src[i] << SAMPLE_SHIFT;
+}
 
-    /* ---- stage A: sum to mono, meter, HPF, limiter; feed tuner PRE-FX --- */
+static void IRAM_ATTR convert_q15(const int32_t *src, int16_t *dst, size_t frames)
+{
+    for (size_t i = 0; i < frames; i++) {
+        dst[2*i]     = (int16_t)(src[2*i]     >> SAMPLE_SHIFT);
+        dst[2*i + 1] = (int16_t)(src[2*i + 1] >> SAMPLE_SHIFT);
+    }
+}
+
+static void dsp_task(void *arg)
+{
+    static int32_t raw_i[BLOCK_WORDS];
+    static int32_t raw_o[BLOCK_WORDS];
+    static int16_t q15_i[BLOCK_WORDS];
+    static int16_t q15_m[BLOCK_SAMPLES];
+    static int16_t q15_o[BLOCK_WORDS];
+
+    /* Fade-in over the first few blocks so the exciter never gets a step. */
+    int warm = 4;
+    uint32_t deadline_us = esp_timer_get_time() + BLOCK_PERIOD_US;
+
+    for (;;) {
+        if (gtr_ring_read_timed(&g_audio.in_ring, raw_i, BYTES_PER_BLOCK,
+                                pdMS_TO_TICKS(20)) != BYTES_PER_BLOCK) {
+            /* I2S RX stalled (no ADC data): emit silence instead of garbage. */
+            memset(raw_o, 0, sizeof(raw_o));
+            gtr_ring_write(&g_audio.out_ring, raw_o, BYTES_PER_BLOCK);
+            continue;
+        }
+        convert_q15(raw_i, q15_i, BLOCK_SAMPLES);
+
+        int64_t t0 = esp_timer_get_time();
+        bool tuner_on = tuner_is_enabled();
+        dsp_stage_input(q15_i, q15_m, BLOCK_SAMPLES, tuner_on);
+        dsp_stage_output(q15_m, q15_i, q15_o, BLOCK_SAMPLES);
+        int64_t elapsed = esp_timer_get_time() - t0;
+
+        if (elapsed > BLOCK_PERIOD_US) {           /* §8 failure handling */
+            dsp_fail_silence(q15_o);               /* zero output, count it */
+        }
+        if (warm > 0) {                            /* startup fade-in ramp */
+            int g = (4 - warm + 1) * 8192;         /* ~0.25..1.0 Q15 */
+            for (int i = 0; i < BLOCK_WORDS; i++)
+                q15_o[i] = sat16(mul_q15(q15_o[i], g));
+            warm--;
+        }
+        convert_int32_back(q15_o, raw_o, BLOCK_WORDS);
+        gtr_ring_write(&g_audio.out_ring, raw_o, BYTES_PER_BLOCK);
+
+        /* Hold the block cadence: absolute-time sleep keeps long-term drift
+         * at zero even if individual iterations jitter. */
+        deadline_us += BLOCK_PERIOD_US;
+        int64_t now = esp_timer_get_time();
+        if (deadline_us - now > 200) {             /* only sleep when we have margin */
+            esp_timer_start_once(s_brief_timer, deadline_us - now - 200);
+            xSemaphoreTake(s_wake_sem, portMAX_DELAY);
+        } else if (now - deadline_us > BLOCK_PERIOD_US * 4) {
+            deadline_us = now;                     /* resync after a big stall */
+        }
+    }
+}
+
+/* ====================== public block processors ======================
+ * The pipeline is split into two IRAM-resident stages so that main.c can
+ * time each independently against the 2.66 ms block budget:
+ *   stage 1: HPF -> tuner tap -> limiter        (anti-feedback front end)
+ *   stage 2: effects rack -> mixer -> gain/xfade -> output buffer
+ * `in`/`out` are interleaved stereo Q15 frames of BLOCK_SAMPLES pairs. */
+void IRAM_ATTR dsp_stage_input(const int16_t *in, int16_t *mono, int n,
+                               bool tuner_on)
+{
     uint32_t peak = 0;
-    for (int i = 0; i < BLOCK_SAMPLES; i++) {
+    for (int i = 0; i < n; i++) {
         int32_t m = ((int32_t)in[2*i] + in[2*i+1]) >> 1;
         uint32_t a = m < 0 ? -(uint32_t)m : (uint32_t)m;
         if (a > peak) peak = a;
+        /* ARCHITECTURE.md order: HPF first (cut sub-bass feedback energy),
+         * then the fast limiter catches transients before the FX rack. */
         mono[i] = soft_clip(hpf_run((int16_t)m));
     }
     s_peak_in = (uint16_t)peak;
 #if CONFIG_TUNER_ENABLED
-    if (tuner_on) tuner_push_frame(mono);
+    /* Tuner tap on the PRE-EFFECTS signal (requirement 5.4). The analysis
+     * itself is throttled internally (TUNER_INTERVAL blocks), so this call
+     * costs only a few hundred cycles on most blocks. */
+    if (tuner_on) tuner_push_frame(mono, n);
 #else
     (void)tuner_on;
 #endif
+}
 
-    /* ---- stage B: effect sends (all read-only wrt s_set fields used here) */
-    for (int i = 0; i < BLOCK_SAMPLES; i++) {
-        wd_[i] = delay_run(mono[i]);
-        wc_[i] = chorus_run(mono[i]);
-        wv_[i] = verb_run(mono[i]);
+void IRAM_ATTR dsp_stage_output(const int16_t *mono, const int16_t *in,
+                                int16_t *out, int n)
+{
+    int16_t wd[BLOCK_SAMPLES], wc[BLOCK_SAMPLES], wv[BLOCK_SAMPLES];
+
+    /* ---- effects rack: Chorus -> Delay -> Reverb (parallel sends) ---- */
+    for (int i = 0; i < n; i++) {
+        wc[i] = chorus_run(mono[i]);
+        wd[i] = delay_run(mono[i]);
+        wv[i] = verb_run(mono[i]);
     }
 
-    /* ---- stage C: mix, master gain, bypass crossfade ---- */
+    /* ---- wet/dry mixer + master gain ---- */
     const int32_t third = 10923;          /* ~32767/3: unity when all at 100% */
-    /* snapshot per block so a UI write cannot tear mid-fade */
+    /* snapshot per block so a UI write cannot tear mid-block */
     int32_t gd = mul_q15(s_set.delay_mix  * 327, third);   /* Q15 wet weights */
     int32_t gc = mul_q15(s_set.chorus_mix * 327, third);
     int32_t gv = mul_q15(s_set.reverb_mix * 327, third);
@@ -365,12 +511,12 @@ void IRAM_ATTR dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on)
     bool fxon = s_set.fx_on;
 
     uint32_t peak_o = 0;
-    for (int i = 0; i < BLOCK_SAMPLES; i++) {
-        int32_t wet = mul_q15(wd_[i], gd) + mul_q15(wc_[i], gc) + mul_q15(wv_[i], gv);
+    for (int i = 0; i < n; i++) {
+        int32_t wet = mul_q15(wd[i], gd) + mul_q15(wc[i], gc) + mul_q15(wv[i], gv);
         wet = sat16(wet);
         /* stereo spread: right channel gets 80% of the wet bus (width cue) */
         int32_t ol  = mul_q15(mono[i] + wet, mg);
-        int32_t orr = mul_q15(mono[i] + sat16(wet - mul_q15(wet, 6554)), mg);
+        int32_t or_ = mul_q15(mono[i] + sat16(wet - mul_q15(wet, 6554)), mg);
 
         if (xf_cnt > 0) {                  /* click-free bypass transition */
             int16_t g = xfade_gain(XFADE_BLOCKS - xf_cnt + 1);
@@ -378,16 +524,24 @@ void IRAM_ATTR dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on)
             int16_t fg = xf_to_fx ? g : k;      /* weight of processed path */
             int16_t dg = xf_to_fx ? k : g;      /* weight of dry path       */
             ol  = mul_q15(ol,  fg) + mul_q15(dry_hold[2*i],   dg);
-            orr = mul_q15(orr, fg) + mul_q15(dry_hold[2*i+1], dg);
-        } else if (!fxon) {
-            ol = in[2*i]; orr = in[2*i+1];
+            or_ = mul_q15(or_, fg) + mul_q15(dry_hold[2*i+1], dg);
+        } else if (!fxon) {                /* true bypass: raw ADC frames */
+            ol = in[2*i]; or_ = in[2*i+1];
         }
         out[2*i]   = sat16(ol);
-        out[2*i+1] = sat16(orr);
+        out[2*i+1] = sat16(or_);
         uint32_t ao = (uint32_t)(ol < 0 ? -ol : ol);
         if (ao > peak_o) peak_o = ao;
     }
     if (xf_cnt > 0) xf_cnt--;
-    memcpy(dry_hold, in, sizeof(dry_hold));
+    memcpy(dry_hold, in, n * 2 * sizeof(int16_t));
     s_peak_out = (uint16_t)peak_o;
+}
+
+/* One-shot convenience wrapper (host tests / bring-up): full chain. */
+void IRAM_ATTR dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on)
+{
+    int16_t mono[BLOCK_SAMPLES];
+    dsp_stage_input(in, mono, BLOCK_SAMPLES, tuner_on);
+    dsp_stage_output(mono, in, out, BLOCK_SAMPLES);
 }

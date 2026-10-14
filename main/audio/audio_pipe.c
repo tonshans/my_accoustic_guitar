@@ -17,7 +17,7 @@ audio_pipe_t g_audio;
 static i2s_chan_handle_t rx_chan;
 static i2s_chan_handle_t tx_chan;
 
-/* ------------------- RX callback (core 0, IRAM) ------------------- */
+/* ------------------- RX callback (I2S ISR context, core 0, IRAM) --------- */
 IRAM_ATTR static bool rx_dma_cb(i2s_chan_handle_t handle,
                                 i2s_event_data_t *event, void *user_ctx)
 {
@@ -100,8 +100,20 @@ esp_err_t audio_pipe_init(void)
                         __TAG, "tx cb");
 
     ESP_RETURN_ON_ERROR(i2s_channel_enable(rx_chan), __TAG, "en rx");
-    /* TX enabled by dsp_task after the silence prefill (no startup pop). */
+    /* TX is enabled by main only AFTER the output ring has been pre-filled
+     * with silence, so the MAX98357A never sees garbage at start-up
+     * (requirement 5.3: no pops or clicks). */
     return ESP_OK;
+}
+
+void audio_pipe_enable_tx(void)
+{
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
+}
+
+void audio_pipe_disable_tx(void)
+{
+    ESP_ERROR_CHECK(i2s_channel_disable(tx_chan));
 }
 
 void audio_pipe_prefill_silence(int blocks)
@@ -111,5 +123,4 @@ void audio_pipe_prefill_silence(int blocks)
     for (int i = 0; i < blocks; i++) {
         gtr_ring_write(&g_audio.out_ring, silence, BYTES_PER_BLOCK);
     }
-    i2s_channel_enable(tx_chan);
 }

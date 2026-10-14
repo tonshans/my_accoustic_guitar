@@ -36,13 +36,31 @@ typedef struct {
 
 void dsp_init(void);
 
-/* One processing call == BLOCK_SAMPLES stereo frames (Q15 int16 pairs).
- * Called only from the DSP task. `tuner_on` routes pre-effect audio to the
- * pitch detector without touching the audio path itself. */
+/* Create + pin the core-0 DSP task (after audio_pipe_init and first preset
+ * load, before audio_pipe_enable_tx). */
+void dsp_start_task(void);
+
+/* Split pipeline (each call handles n stereo Q15 frames, n <= BLOCK_SAMPLES).
+ * Called only from the core-0 DSP task; timed separately against the block
+ * budget by main.c (ARCHITECTURE.md §8 failure handling).
+ *   stage 1: HPF -> tuner tap -> limiter
+ *   stage 2: effects rack -> wet/dry mixer -> master gain -> bypass xfade */
+void dsp_stage_input(const int16_t *in, int16_t *mono, int n, bool tuner_on);
+void dsp_stage_output(const int16_t *mono, const int16_t *in, int16_t *out, int n);
+
+/* Convenience full-chain wrapper (host tests / bring-up). */
 void dsp_process_block(const int16_t *in, int16_t *out, bool tuner_on);
+
+/* Incremented whenever a processed block exceeded the block deadline and the
+ * output was forced to silence (should stay at 0 during normal playing). */
+extern volatile uint32_t g_dsp_overruns;
 
 /* Snapshot of live settings (copy — safe from any task). */
 void dsp_get_settings(dsp_settings_t *dst);
+
+/* Replace all settings at once (preset load path; runs on core 1, takes the
+ * param mutex, recomputes coefficients — never mid-sample). */
+void dsp_apply_settings(const dsp_settings_t *src);
 
 /* Field ids used by the UI page descriptors (dsp_set_field): */
 enum {
@@ -57,6 +75,11 @@ enum {
 void dsp_set_field(int field_id, int value);
 
 void dsp_set_fx(bool on);               /* triggers a click-free crossfade */
+bool dsp_get_fx(void);                  /* current bypass state            */
+
+/* Preset index bookkeeping (contents live in presets.c; this only mirrors
+ * the index so the DSP/UI agree without extra locking). */
+void dsp_set_preset(int idx);
 
 /* Metering for the OLED level bar (peak of last processed block, Q15). */
 uint16_t dsp_peak_in(void);

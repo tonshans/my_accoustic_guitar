@@ -1,16 +1,21 @@
 # ============================================================
 #  Acoustic Guitar FX + Tuner — ESP32-S3 N16R8 (Phase 1)
-#  Piezo -> MCP6002 -> PCM1808 -> I2S0 RX -> DSP -> I2S1 TX -> MAX98357A -> Exciter
+#  Pin map follows ARCHITECTURE.md / pinout table:
+#   I2S0 RX : PCM1808   BCLK=4  LRCK=5  DATA=6   (ESP32 is I2S master, no MCLK wire)
+#   I2S1 TX : MAX98357A BCLK=15 LRCK=16 DATA=17  (internal PLL, no MCLK wire)
+#   I2C     : OLED      SDA=8   SCL=9
+#   Control : Encoder   A=10    B=11    SW=12 ; BTN1=13 ; BTN2=14
+#   Analog  : Battery   GPIO2   (ADC1_CH1, via divider)
 # ============================================================
 
 config SAMPLE_RATE
     int "Audio sample rate (Hz)"
-    default 44100
+    default 48000
 
 config AUDIO_FRAME_SAMPLES
     int "Samples per processing block (per channel)"
     default 128
-    help Ring-block size. 128 @ 44.1 kHz = ~2.9 ms granularity.
+    help Ring-block size. 128 @ 48 kHz = ~2.66 ms granularity.
 
 config TUNER_ENABLED
     bool "Enable chromatic tuner"
@@ -19,7 +24,7 @@ config TUNER_ENABLED
 # ---------------- Anti-feedback chain ----------------
 config HPF_CUTOFF_HZ
     int "High-pass cutoff (Hz), suppresses body/soundhole feedback"
-    default 90
+    default 80
 
 config LIMITER_THRESHOLD
     hex "Soft-clip threshold (Q15). 0x7fff = full scale"
@@ -42,7 +47,7 @@ config DELAY_FEEDBACK_PCT_DFLT
 
 config DELAY_MIX_PCT_DFLT
     int "Default delay wet mix (%)"
-    default 35
+    default 25
 
 config CHORUS_RATE_MHZ
     int "Default chorus LFO rate (mHz)"
@@ -58,37 +63,50 @@ config CHORUS_MIX_PCT_DFLT
 
 config REVERB_MIX_PCT_DFLT
     int "Default reverb wet mix (%)"
-    default 25
+    default 35
 
 # ---------------- UI timing ----------------
 config UI_PERIOD_MS
     int "UI / tuner refresh period (ms)"
     default 20
 
-# ---------------- Pin assignments (ESP32-S3-WROOM-1 N16R8) ----------------
+# ---------------- Battery monitor ----------------
+menu "Battery ADC (GPIO2 = ADC1_CH1, via resistor divider)"
+    config BAT_DIVIDER_X100
+        int "Divider ratio x100 (Vbat/Vadc), e.g. 300 for Rtop=2M Rbot=1M"
+        default 300
+    config BAT_FULL_MV
+        int "Battery mV that maps to 100% charge"
+        default 4200
+    config BAT_EMPTY_MV
+        int "Battery mV that maps to 0% charge (LDO headroom limit)"
+        default 3200
+endmenu
+
+# ---------------- Pin assignments (ESP32-S3-WROOM-1, per ARCHITECTURE.md) ----------------
 menu "I2S pin assignments"
     config I2S_IN_BCK_PIN
-        int "PCM1808 BCK GPIO (ESP32 is I2S master)"
-        default 12
+        int "PCM1808 BCLK GPIO (ESP32 is I2S master)"
+        default 4
     config I2S_IN_WS_PIN
-        int "PCM1808 WS / LRCLK GPIO"
-        default 11
+        int "PCM1808 LRCK / WS GPIO"
+        default 5
     config I2S_IN_DIN_PIN
         int "PCM1808 DOUT -> ESP32 SD input GPIO"
-        default 13
+        default 6
     config I2S_IN_MCLK_PIN
-        int "PCM1808 MCLK GPIO (-1 = not wired)"
-        default 10
+        int "PCM1808 MCLK GPIO (-1 = not wired; PCM1808 accepts BCLK-only clocking)"
+        default -1
 
     config I2S_OUT_BCK_PIN
-        int "MAX98357A BCK GPIO"
-        default 18
+        int "MAX98357A BCLK GPIO"
+        default 15
     config I2S_OUT_WS_PIN
         int "MAX98357A L/RCLK GPIO"
-        default 17
+        default 16
     config I2S_OUT_DOUT_PIN
         int "MAX98357A DIN GPIO"
-        default 16
+        default 17
     config I2S_OUT_MCLK_PIN
         int "MAX98357A MCLK GPIO (-1 = not connected, internal PLL)"
         default -1
@@ -112,15 +130,18 @@ endmenu
 
 menu "Encoder & buttons"
     config ENC_A_PIN
-        int "Rotary encoder A GPIO"
-        default 6
+        int "Rotary encoder CLK (A) GPIO"
+        default 10
     config ENC_B_PIN
-        int "Rotary encoder B GPIO"
-        default 7
-    config BTN_SEL_PIN
-        int "BTN_SEL GPIO (short: preset next, long: save preset)"
-        default 5
+        int "Rotary encoder DT (B) GPIO"
+        default 11
+    config BTN_ENC_PIN
+        int "Rotary encoder push-switch GPIO (UI select / parameter edit)"
+        default 12
     config BTN_ACT_PIN
-        int "BTN_ACT GPIO (short: bypass, long: tuner toggle)"
-        default 4
+        int "Push button 1 GPIO (short: bypass, long: tuner toggle)"
+        default 13
+    config BTN_PRESET_PIN
+        int "Push button 2 GPIO (preset cycle)"
+        default 14
 endmenu

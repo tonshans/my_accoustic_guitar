@@ -11,13 +11,13 @@
 #include "tuner.h"
 #include "board.h"
 
-#define TUNER_FS          (SAMPLE_RATE / 2)        /* 22 050 Hz after decimator */
+#define TUNER_FS          (SAMPLE_RATE / 2)        /* 24 000 Hz after decimator */
 #define WIN               1160                     /* ~52 ms buffer             */
-#define LAG_MIN           44                       /* 501 Hz max                */
-#define LAG_MAX           1100                     /* 20.0 Hz min (low E ~41)   ]*/
+#define LAG_MIN           46                       /* 522 Hz max (above high E) */
+#define LAG_MAX           1150                     /* 20.9 Hz min (< low E 41 Hz)*/
 #define GATE_ON           800                      /* Q15 open threshold        */
 #define GATE_OFF          400                      /* hysteresis close          */
-#define TUNER_INTERVAL    4                        /* analyze every N blocks   */
+#define TUNER_INTERVAL    4                        /* analyze every N blocks (~10.6 ms) */
 #define IN_TUNE_CENTS     2
 #define A4_HZ             440.0f
 
@@ -28,6 +28,7 @@ static int32_t  lp_state;
 static uint16_t frame_peak;
 static uint32_t block_ctr;
 static bool     gate_open;
+static volatile bool s_enabled = true;   /* UI toggles; DSP task reads      */
 
 static tuner_result_t res;
 static float hist[5]; static int hist_n, hist_i;
@@ -49,10 +50,10 @@ static inline int16_t sat16_in(int32_t v)
     return (int16_t)v;
 }
 
-static inline void decimate_push(const int16_t *mono)
+static inline void decimate_push(const int16_t *mono, int n)
 {
     /* 2x decimation with one-pole anti-alias LP, alpha = 1/16 */
-    for (int i = 0; i < BLOCK_SAMPLES; i += 2) {
+    for (int i = 0; i + 1 < n; i += 2) {
         int32_t x = ((int32_t)mono[i] + mono[i+1]) >> 1;
         lp_state += (x - (lp_state >> 4));          /* pole at fc ~= fs/10     */
         buf[wr] = sat16_in(lp_state >> 4);          /* true LP output          */
@@ -161,10 +162,10 @@ static void analyze(void)
     note_map(res.freq ? res.freq : f);
 }
 
-void tuner_push_frame(const int16_t *mono)
+void tuner_push_frame(const int16_t *mono, int n)
 {
     uint32_t pk = 0;
-    for (int i = 0; i < BLOCK_SAMPLES; i++) {
+    for (int i = 0; i < n; i++) {
         uint32_t a = mono[i] < 0 ? -(uint32_t)mono[i] : (uint32_t)mono[i];
         if (a > pk) pk = a;
     }
@@ -176,7 +177,7 @@ void tuner_push_frame(const int16_t *mono)
     if (!gate_open && pk > GATE_ON)  gate_open = true;
     if ( gate_open && pk < GATE_OFF) gate_open = false;
 
-    decimate_push(mono);
+    decimate_push(mono, n);
 
     if (++block_ctr < TUNER_INTERVAL) return;
     block_ctr = 0;
@@ -195,3 +196,6 @@ void tuner_get(tuner_result_t *dst)
 {
     *dst = res;
 }
+
+void tuner_set_enabled(bool on) { s_enabled = on; }
+bool tuner_is_enabled(void)     { return s_enabled; }

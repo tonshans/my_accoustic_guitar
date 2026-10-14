@@ -26,8 +26,14 @@ extern audio_pipe_t g_audio;
 esp_err_t audio_pipe_init(void);
 
 /* Pre-fill the output ring with `blocks` silent blocks so the TX DMA never
- * sees an empty buffer at start-up (pop/click prevention). */
+ * sees an empty buffer at start-up (pop/click prevention). Call BEFORE
+ * audio_pipe_enable_tx(). */
 void audio_pipe_prefill_silence(int blocks);
+
+/* Start/stop the TX side (MAX98357A). Enabled only after the silence prefill;
+ * disabled again during shutdown fade-out to avoid a power-down thump. */
+void audio_pipe_enable_tx(void);
+void audio_pipe_disable_tx(void);
 
 #ifdef __cplusplus
 }
