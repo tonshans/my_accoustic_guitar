@@ -25,6 +25,8 @@ config TUNER_ENABLED
 config HPF_CUTOFF_HZ
     int "High-pass cutoff (Hz), suppresses body/soundhole feedback"
     default 80
+    help Stored in settings as kHz*10 (uint8 field): 80 -> 800. Valid UI
+         choices are OFF/80/90/100 Hz; any other value is clamped by the DSP.
 
 config LIMITER_THRESHOLD
     hex "Soft-clip threshold (Q15). 0x7fff = full scale"

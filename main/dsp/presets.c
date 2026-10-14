@@ -35,7 +35,7 @@ static void defaults(dsp_settings_t *s)
     s->delay_fb         = CONFIG_DELAY_FEEDBACK_PCT_DFLT;
     s->chorus_rate_mhz  = CONFIG_CHORUS_RATE_MHZ;
     s->chorus_depth_us  = CONFIG_CHORUS_DEPTH_US;
-    s->hpf_hz           = CONFIG_HPF_CUTOFF_HZ;
+    s->hpf_hz           = CONFIG_HPF_CUTOFF_HZ * 10;   /* kHz*10 encoding */
     s->master_pct       = CONFIG_OUTPUT_GAIN_PCT;
 }
 

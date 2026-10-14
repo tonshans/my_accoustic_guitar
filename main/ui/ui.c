@@ -59,9 +59,15 @@ static int get_delay_fb(void)    { dsp_settings_t s; dsp_get_settings(&s); retur
 static int get_ch_rate(void)     { dsp_settings_t s; dsp_get_settings(&s); return s.chorus_rate_mhz; }
 static int get_ch_depth(void)    { dsp_settings_t s; dsp_get_settings(&s); return s.chorus_depth_us; }
 static int get_master(void)      { dsp_settings_t s; dsp_get_settings(&s); return s.master_pct; }
-static int get_hpf_sel(void)     { dsp_settings_t s; dsp_get_settings(&s); return s.hpf_hz ? s.hpf_hz / 10 - 8 : 0; }
-/* hpf_sel index -> cutoff: 0=OFF, 1=80 Hz, 2=90 Hz, 3=100 Hz */
-static void set_hpf_sel(int i)   { static const int t[4] = {0, 80, 90, 100};
+/* hpf stored as kHz*10 (800/900/1000 Hz, 0 = off) so it fits uint8_t */
+static int get_hpf_sel(void)     { dsp_settings_t s; dsp_get_settings(&s);
+                                   switch (s.hpf_hz) {
+                                   case 800:  return 1;
+                                   case 900:  return 2;
+                                   case 1000: return 3;
+                                   default:   return 0; } }
+/* hpf_sel index -> cutoff (kHz*10): 0=OFF, 1=80 Hz, 2=90 Hz, 3=100 Hz */
+static void set_hpf_sel(int i)   { static const int t[4] = {0, 800, 900, 1000};
                                    dsp_set_field(FLD_HPF, t[i & 3]); }
 
 /* per-page editable rows; row 0 of each page is the default selection */
@@ -161,7 +167,8 @@ static void render_pages(bool fx_on)
     char b[20];
     switch (s_page) {
     case PAGE_HOME: {
-        draw_header("GTR FX");        dsp_settings_t s; dsp_get_settings(&s);
+        draw_header("GTR FX");
+        dsp_settings_t s; dsp_get_settings(&s);
         snprintf(b, sizeof b, "PRESET %d  %s", presets_current() + 1,
                  fx_on ? "FX ON " : "BYPASS");
         oled_str(2, 1, b, false);
@@ -209,13 +216,14 @@ static void render_pages(bool fx_on)
         /* frequency line */
         if (t.freq > 0) snprintf(b, sizeof b, "%u.%02u Hz",
                                  (unsigned)t.freq,
-                                 (unsigned)(t.freq * 100) % 100);
+                                 (unsigned)(t.freq * 100.0f + 0.5f) % 100u);
         else            snprintf(b, sizeof b, "-- Hz");
         oled_str(2, 4, b, false);
         /* cents scale: center tick + moving pointer */
         oled_hline(4, 40, 120, true);
         int px = 64 + (t.cents * 60) / 50;
-        if (px < 4) px = 4; if (px > 123) px = 123;
+        if (px < 4) px = 4;
+        if (px > 123) px = 123;
         oled_fill_rect(px, 36, 2, 8, true);
         oled_fill_rect(63, 34, 2, 12, true);      /* center marker */
         snprintf(b, sizeof b, "%+d cents%s", t.cents,
@@ -290,12 +298,15 @@ static void ui_task(void *arg)
     while (!dsp_task_alive()) vTaskDelay(pdMS_TO_TICKS(50));
 
     uint32_t redraw_ctr = 0;
-    const uint32_t redraw_every = CONFIG_UI_PERIOD_MS ? (100 / CONFIG_UI_PERIOD_MS) : 5;
+    /* repaint every ~100 ms regardless of the (faster) input-scan tick */
+    const uint32_t redraw_every = (100 + CONFIG_UI_PERIOD_MS - 1) / CONFIG_UI_PERIOD_MS;
 
     for (;;) {
         ui_event_t ev;
         while ((ev = encoder_poll()) != EV_NONE)
             handle_event(ev);
+
+        battery_sample();               /* ADC read ~1 ms, core 1 only */
 
         if (++redraw_ctr >= redraw_every) {
             redraw_ctr = 0;

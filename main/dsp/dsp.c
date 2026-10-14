@@ -104,6 +104,17 @@ static void hpf_compute(float fc)
  * avoids reading the settings struct inside the sample loop. */
 static bool s_hpf_bypass;
 
+/* The settings field stores cutoff in kHz*10 so it fits a uint8_t
+ * (80 Hz -> 800, 1000 Hz would overflow). Anything outside the anti-larsen
+ * band clamps to 80 Hz; 0 disables the HPF (s_hpf_bypass). */
+static inline float hpf_hz_of(uint8_t encoded)
+{
+    int hz = encoded * 10;
+    if (hz < 80)  hz = 80;
+    if (hz > 100) hz = 100;
+    return (float)hz;
+}
+
 static inline IRAM_ATTR int16_t hpf_run(int16_t x)
 {
     if (s_hpf_bypass) return x;
@@ -349,7 +360,7 @@ static void apply_coef(void)
                          * 4294967295.99);
     cho_depth_q16 = (int32_t)((double)s_set.chorus_depth_us / 1e6
                               * SAMPLE_RATE * 65536.0 / 2.0);
-    hpf_compute(s_set.hpf_hz ? (float)s_set.hpf_hz : 80.0f);
+    hpf_compute(hpf_hz_of(s_set.hpf_hz));
 }
 
 void dsp_set_field(int field_id, int value)
@@ -423,7 +434,7 @@ void dsp_init(void)
     s_set.delay_fb        = CONFIG_DELAY_FEEDBACK_PCT_DFLT;
     s_set.chorus_rate_mhz = CONFIG_CHORUS_RATE_MHZ;
     s_set.chorus_depth_us = CONFIG_CHORUS_DEPTH_US;
-    s_set.hpf_hz          = CONFIG_HPF_CUTOFF_HZ;
+    s_set.hpf_hz          = CONFIG_HPF_CUTOFF_HZ * 10;   /* kHz*10 encoding */
     s_set.master_pct      = CONFIG_OUTPUT_GAIN_PCT;
 
     dly_buf  = alloc_line((size_t)(0.4f * SAMPLE_RATE), &dly_mask);
@@ -439,10 +450,18 @@ void dsp_init(void)
 }
 
 /* Forward declaration: the core-0 block-cadence task is defined below. */
-static void IRAM_ATTR dsp_task(void *arg);
+static void dsp_task(void *arg);
 
 void dsp_start_task(void)
 {
+    /* Block scratch in internal RAM (see note above the pointer decls). */
+    raw_i  = heap_caps_malloc(BLOCK_WORDS * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    raw_o  = heap_caps_malloc(BLOCK_WORDS * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    q15_i  = heap_caps_malloc(BLOCK_WORDS * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    q15_o  = heap_caps_malloc(BLOCK_WORDS * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    q15_m  = heap_caps_malloc(BLOCK_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    assert(raw_i && raw_o && q15_i && q15_o && q15_m);
+
     s_wake_sem = xSemaphoreCreateBinary();
     const esp_timer_create_args_t ta = { .callback = cadence_timer_cb,
                                          .dispatch_method = ESP_TIMER_ISR,
@@ -473,13 +492,17 @@ void dsp_reset_timing_stats(void)
     g_dsp_overruns = 0;
 }
 
-/* ------------------------- DSP task (core 0) -------------------------
- * Owns the audio block clock: one iteration per BLOCK_PERIOD_US. Reads a raw
- * int32 stereo block from the RX ring, converts to Q15, snapshots the UI
- * settings once per block, runs the two pipeline stages under a hard deadline
- * watch, and hands the result to the TX ring. No allocations, no logging, no
- * flash access in this loop. */
-static void dsp_task(void *arg);
+/* Block scratch buffers: file-scope so they can live in internal RAM via
+ * heap_caps_malloc (plain `static` arrays would land in .bss, which on this
+ * build sits in PSRAM-mapped address space — unacceptable inside the core-0
+ * audio path). Sizes are fixed at compile time, allocated once in
+ * dsp_start_task(), never reallocated while the task runs. */
+static int32_t *raw_i, *raw_o;        /* interleaved 32-bit DMA slots   */
+static int16_t *q15_i, *q15_o;        /* interleaved stereo Q15 frames  */
+static int16_t *q15_m;                /* mono post-front-end Q15        */
+static int16_t s_wd[BLOCK_SAMPLES], s_wc[BLOCK_SAMPLES], s_wv[BLOCK_SAMPLES];
+                                      /* wet-send scratch (stage output)*/
+
 /* PCM1808/MAX98357A are configured as I2S masters with 32-bit Philips slots:
  * the ADC right-justifies its 24 valid bits in the slot (bits 3..26), so we
  * take bits 14..29 for a Q15 value that sits 2 dB below full scale — exactly
@@ -500,13 +523,14 @@ static void IRAM_ATTR convert_q15(const int32_t *src, int16_t *dst, size_t frame
     for (size_t i = 0; i < 2 * frames; i++) dst[i] = q15_from_i32(src[i]);
 }
 
+/* ------------------------- DSP task (core 0) -------------------------
+ * Owns the audio block clock: one iteration per BLOCK_PERIOD_US. Reads a raw
+ * int32 stereo block from the RX ring, converts to Q15, snapshots the UI
+ * settings once per block, runs the two pipeline stages under a hard deadline
+ * watch, and hands the result to the TX ring. No allocations, no logging, no
+ * flash access in this loop. */
 static void dsp_task(void *arg)
 {
-    static int32_t raw_i[BLOCK_WORDS];
-    static int32_t raw_o[BLOCK_WORDS];
-    static int16_t q15_i[BLOCK_WORDS];
-    static int16_t q15_m[BLOCK_SAMPLES];
-    static int16_t q15_o[BLOCK_WORDS];
 
     /* Fade-in over the first few blocks so the exciter never gets a step. */
     int warm = 4;
@@ -516,7 +540,7 @@ static void dsp_task(void *arg)
         if (gtr_ring_read_timed(&g_audio.in_ring, raw_i, BYTES_PER_BLOCK,
                                 pdMS_TO_TICKS(20)) != BYTES_PER_BLOCK) {
             /* I2S RX stalled (no ADC data): emit silence instead of garbage. */
-            memset(raw_o, 0, sizeof(raw_o));
+            memset(raw_o, 0, BYTES_PER_BLOCK);
             gtr_ring_write(&g_audio.out_ring, raw_o, BYTES_PER_BLOCK);
             continue;
         }
@@ -558,6 +582,7 @@ static void dsp_task(void *arg)
         if (deadline_us - now > 200) {             /* only sleep when we have margin */
             esp_timer_start_once(s_cadence_timer, deadline_us - now - 200);
             xSemaphoreTake(s_wake_sem, portMAX_DELAY);
+            esp_timer_stop(s_cadence_timer);       /* disarm; one-shot may already have fired */
         } else if (now - deadline_us > BLOCK_PERIOD_US * 4) {
             deadline_us = now;                     /* resync after a big stall */
         }
@@ -596,7 +621,9 @@ void IRAM_ATTR dsp_stage_input(const int16_t *in, int16_t *mono, int n,
 void IRAM_ATTR dsp_stage_output(const int16_t *mono, const int16_t *in,
                                 int16_t *out, int n)
 {
-    int16_t wd[BLOCK_SAMPLES], wc[BLOCK_SAMPLES], wv[BLOCK_SAMPLES];
+    /* wet sends land in file-scope internal-RAM buffers (no stack VLA-style
+     * frame pressure inside the IRAM task; see dsp_start_task allocation) */
+    int16_t *wd = s_wd, *wc = s_wc, *wv = s_wv;
 
     /* ---- effects rack: Chorus -> Delay -> Reverb (parallel sends) ---- */
     for (int i = 0; i < n; i++) {

@@ -171,7 +171,7 @@ void tuner_push_frame(const int16_t *mono, int n)
     }
     /* peak decay so the UI bar reacts smoothly */
     if (pk < frame_peak) pk = frame_peak - (frame_peak - pk + 1) / 2;
-    frame_peak = (uint16_t)pk;
+    frame_peak = (uint16_t)(pk > 32767u ? 32767u : pk);   /* Q15: clamp to int16 span */
     res.peak = frame_peak;
 
     if (!gate_open && pk > GATE_ON)  gate_open = true;

@@ -30,7 +30,7 @@ typedef struct {
     uint8_t  delay_fb;                  /* feedback 0..90 %                   */
     uint16_t chorus_rate_mhz;           /* LFO rate in millihertz 100..2000   */
     uint16_t chorus_depth_us;           /* modulation depth in microseconds   */
-    uint8_t  hpf_hz;                    /* HPF cutoff: 80/90/100 (0 = off)    */
+    uint8_t  hpf_hz;                    /* cutoff kHz*10: 800/900/1000 (0=off) */
     uint8_t  master_pct;                /* output gain %, conservative        */
 } dsp_settings_t;
 
